@@ -4546,6 +4546,10 @@ void MainWindow::cleanupLobbySpectateSession()
     // also end before its header launches emulation, so refresh that case here.
     if (!this->emulationThread->isRunning())
         this->updateUI(false, false);
+
+    // A switch to another match was waiting for this session to be gone.
+    if (this->rollbackLobbyDialog != nullptr)
+        this->rollbackLobbyDialog->notifySpectateSessionClosed();
 }
 #endif // NETPLAY
 

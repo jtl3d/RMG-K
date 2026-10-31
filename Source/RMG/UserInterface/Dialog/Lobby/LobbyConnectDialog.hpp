@@ -21,6 +21,8 @@ namespace UserInterface
 namespace Dialog
 {
 
+class LobbyButton;
+
 // Small modal asking for a username before opening the main lobby. Server URL
 // is hardcoded to the production endpoint; persists username via QSettings.
 class LobbyConnectDialog : public QDialog
@@ -51,7 +53,7 @@ private:
     void saveSettings();
 
     QLineEdit*   m_usernameEdit  = nullptr;
-    QPushButton* m_connectButton = nullptr;
+    LobbyButton* m_connectButton = nullptr;
     QLabel*      m_validationLbl = nullptr;
 
     QString m_serverUrl;
