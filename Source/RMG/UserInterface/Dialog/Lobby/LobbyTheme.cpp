@@ -417,6 +417,10 @@ QString styleSheet()
         QMenu::separator { height: 1px; background: @line; margin: 3px 0; }
         QMenu::indicator { width: 12px; height: 12px; left: 6px; }
 
+        QMenu#LobbyMenu { background: transparent; border: none; padding: 4px 0 5px 0; }
+        QMenu#LobbyMenu::item { padding: 6px 30px 6px 36px; background: transparent; }
+        QMenu#LobbyMenu::separator { height: 9px; background: transparent; margin: 0; }
+
         QLabel[role="ink2"] { color: @ink2; }
         QLabel[role="muted"] { color: @muted; }
         QLabel[role="faint"] { color: @faint; }
@@ -469,6 +473,22 @@ QString styleSheet()
             color: #ffffff; background-color: @liveBg; border-radius: 7px; padding: 0 4px;
             min-width: 6px; min-height: 14px; max-height: 14px;
         }
+        QLabel#ChatBadge[mention="true"] { color: @onWarn; background-color: @warn; }
+
+        QPushButton#MentionJump {
+            min-height: 22px; max-height: 22px; padding: 0 10px; border-radius: 12px;
+            background-color: @raise; color: @ink; border: 1px solid @line2;
+        }
+        QPushButton#MentionJump:hover { border-color: @warn; }
+
+        QFrame#PmThreadHeader { background: transparent; border: none; border-bottom: 1px solid @line; }
+        QFrame#ChallengeVersus { background-color: @tint; border: 1px solid @line; border-radius: 10px; }
+        QFrame#SanctionNote { background-color: @warnTint; border: 1px solid @warnEdge; border-radius: 8px; }
+        QFrame#ModerationRow { background: transparent; border: none; border-bottom: 1px solid @line; }
+
+        QComboBox#ChallengeRomCombo { background: transparent; border: none; padding: 0; color: @ink; }
+        QComboBox#ChallengeRomCombo::drop-down { width: 0; border: none; }
+        QComboBox#ChallengeRomCombo::down-arrow { image: none; width: 0; height: 0; }
 
         QFrame#RomPicker { background-color: @well; border: 1px solid @line2; border-radius: 9px; }
         QFrame#RomPicker:focus { border-color: @accent; }
@@ -540,6 +560,8 @@ QString styleSheet()
         {"@panel2", t.panel2}, {"@accent", t.accent}, {"@panel", t.panel}, {"@raise", t.raise},
         {"@line2", t.line2}, {"@line", t.line}, {"@well", t.well}, {"@tint", t.tint},
         {"@ink2", t.ink2}, {"@ink", t.ink}, {"@muted", t.muted}, {"@faint", t.faint},
+        {"@warnEdge", mix(t.warn, t.line, 0.35)}, {"@warnTint", t.warnTint},
+        {"@onWarn", t.dark ? QColor("#1f1400") : QColor("#ffffff")},
         {"@warn", t.warn}, {"@bad", t.bad}, {"@bg", t.bg},
     };
     qss.replace(QStringLiteral("@chevron"), chevron);

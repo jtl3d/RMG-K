@@ -35,6 +35,8 @@
 #include "LobbyWidgets.hpp"
 #include "CreateRoomDialog.hpp"
 #include "LobbyRegions.hpp"
+#include "LobbySocialDialogs.hpp"
+#include "LobbySocialWidgets.hpp"
 
 #include <RMG-Core/Callback.hpp>
 #include <RMG-Core/Directories.hpp>
@@ -52,6 +54,9 @@
 #include <QApplication>
 #include <QCoreApplication>
 #include <QAbstractItemView>
+#include <QAction>
+#include <QCursor>
+#include <QStyle>
 #include <QPalette>
 #include <QStyledItemDelegate>
 #include <QPainter>
@@ -62,11 +67,7 @@
 #include <QStackedWidget>
 #include <QTabBar>
 #include <QTreeWidget>
-#include <QTextEdit>
-#include <QTextBlock>
-#include <QTextCursor>
 #include <QTextDocument>
-#include <QScrollBar>
 #include <QLineEdit>
 #include <QJsonArray>
 #include <QPushButton>
@@ -101,6 +102,7 @@
 #include <QLocale>
 #include <QMenu>
 #include <algorithm>
+#include <functional>
 #include <memory>
 #include <vector>
 #include <cstdio>
@@ -148,11 +150,6 @@ namespace
     const char* const CHANNEL_ROOM  = "room";
     // Viewers of one live replay; the server never relays it to the players.
     const char* const CHANNEL_SPECTATE = "spectate";
-
-    // Chat tabs. Room only shows while seated, Spectators only while watching.
-    constexpr int kChatTabLobby      = 0;
-    constexpr int kChatTabRoom       = 1;
-    constexpr int kChatTabSpectators = 2;
 
     // MIME type carrying the dragged seat's slot during a host reorder drag.
     const char* const kSeatMime = "application/x-rmgk-seat-slot";
@@ -253,24 +250,6 @@ namespace
         return t.muted.name();
     }
 
-    // QTextEdit::append only follows new lines while the view is exactly at
-    // the bottom. When the text grows without an append, the reader is left
-    // a few lines up and every later append stays parked there. That happens
-    // when the splitter narrows the chat column and lines rewrap. Remember
-    // whether the reader was at the bottom and keep them there when the range
-    // grows; scrolling up still holds the view.
-    void keepChatAtBottom(QTextEdit* view)
-    {
-        QScrollBar* bar = view->verticalScrollBar();
-        auto atBottom = std::make_shared<bool>(true);
-        QObject::connect(bar, &QScrollBar::valueChanged, view, [bar, atBottom](int value) {
-            *atBottom = value >= bar->maximum();
-        });
-        QObject::connect(bar, &QScrollBar::rangeChanged, view, [bar, atBottom](int, int max) {
-            if (*atBottom) bar->setValue(max);
-        });
-    }
-
     // Roles backing the painted players list (see PlayersItemDelegate).
     // Qt::UserRole itself carries the user id.
     constexpr int kGroupRole          = Qt::UserRole + 1; // this row heads a group
@@ -281,6 +260,7 @@ namespace
     constexpr int kPingMsRole         = Qt::UserRole + 6; // int; -1 = unknown
     constexpr int kPingEstimateRole   = Qt::UserRole + 7; // value is a region estimate
     constexpr int kConnectionTypeRole = Qt::UserRole + 8; // "wifi", "lan", ...
+    constexpr int kSocialRole         = Qt::UserRole + 9; // can be challenged and messaged
 
     QString countryTooltip(const QString& country)
     {
@@ -294,11 +274,16 @@ namespace
     }
 
     // Paints the players list: group headings, and for each player a state
-    // dot, name, flag, signal bars and connection symbol on one line.
+    // dot, name, flag, signal bars and connection symbol on one line. Hovering a
+    // row swaps the bars and symbol for Challenge and Message buttons, since a
+    // right-click menu is easy to never find.
     class PlayersItemDelegate : public QStyledItemDelegate
     {
     public:
         using QStyledItemDelegate::QStyledItemDelegate;
+
+        std::function<void(quint64)> onChallenge;
+        std::function<void(quint64)> onMessage;
 
         QSize sizeHint(const QStyleOptionViewItem& option, const QModelIndex& index) const override
         {
@@ -345,6 +330,7 @@ namespace
                 painter->drawRoundedRect(box, 6, 6);
             }
 
+            const bool quickButtons = showsQuickButtons(option, index);
             const qreal centerY = box.center().y();
             painter->setPen(Qt::NoPen);
             painter->setBrush(QColor(stateHex(index.data(kStateRole).toString(), t.dark)));
@@ -353,10 +339,29 @@ namespace
             // Right side, from the edge inward: connection symbol, bars.
             int right = r.right() - 6;
             const QString connection = index.data(kConnectionTypeRole).toString();
-            if (!connection.isEmpty())
+            if (quickButtons)
+            {
+                const QPoint cursor = option.widget
+                    ? static_cast<const QAbstractItemView*>(option.widget)->viewport()->mapFromGlobal(QCursor::pos())
+                    : QPoint();
+                const qreal dpr = option.widget ? option.widget->devicePixelRatioF() : 1.0;
+                const auto paintButton = [&](const QRect& button, const QString& icon) {
+                    const bool hot = button.contains(cursor);
+                    painter->setPen(Qt::NoPen);
+                    painter->setBrush(hot ? t.accent : t.tint);
+                    painter->drawRoundedRect(QRectF(button), 5, 5);
+                    painter->drawPixmap(button.center().x() - 6, button.center().y() - 6,
+                                        LobbyTheme::icon(icon, hot ? QColor(Qt::white) : t.ink2, 13, dpr));
+                };
+                paintButton(challengeRect(r), QStringLiteral("sword-fill"));
+                paintButton(messageRect(r), QStringLiteral("mail-line"));
+                right = challengeRect(r).left() - 5;
+            }
+            else if (!connection.isEmpty())
                 ConnectionGlyph::paintSymbol(*painter, QRectF(right - 15, r.top(), 16, r.height()), connection, t.muted);
-            right -= 16 + 5;
-            if (!isSelf)
+            if (!quickButtons)
+                right -= 16 + 5;
+            if (!isSelf && !quickButtons)
             {
                 LobbyTheme::paintPingBars(*painter, QPointF(right - 13, centerY + 6),
                                           index.data(kPingMsRole).toInt(),
@@ -393,6 +398,55 @@ namespace
                 painter->drawPixmap(QPointF(x + 7, centerY - 5), flag);
 
             painter->restore();
+        }
+
+        bool editorEvent(QEvent* event, QAbstractItemModel* model, const QStyleOptionViewItem& option,
+                         const QModelIndex& index) override
+        {
+            const auto type = event->type();
+            if (index.data(kSocialRole).toBool() &&
+                (type == QEvent::MouseMove || type == QEvent::MouseButtonPress ||
+                 type == QEvent::MouseButtonRelease || type == QEvent::MouseButtonDblClick))
+            {
+                auto* mouse = static_cast<QMouseEvent*>(event);
+                const QPoint pos = mouse->position().toPoint();
+                const bool onChallengeButton = challengeRect(option.rect).contains(pos);
+                const bool onMessageButton = messageRect(option.rect).contains(pos);
+                if (type == QEvent::MouseMove)
+                {
+                    if (option.widget)
+                        static_cast<const QAbstractItemView*>(option.widget)->viewport()->update(option.rect);
+                }
+                else if (onChallengeButton || onMessageButton)
+                {
+                    if (type == QEvent::MouseButtonRelease && mouse->button() == Qt::LeftButton)
+                    {
+                        const quint64 userId = index.data(Qt::UserRole).toULongLong();
+                        if (onChallengeButton && onChallenge)
+                            onChallenge(userId);
+                        else if (onMessageButton && onMessage)
+                            onMessage(userId);
+                    }
+                    return true;
+                }
+            }
+            return QStyledItemDelegate::editorEvent(event, model, option, index);
+        }
+
+    private:
+        static QRect messageRect(const QRect& row)
+        {
+            return QRect(row.right() - 3 - 22, row.top() + 2, 22, row.height() - 4);
+        }
+
+        static QRect challengeRect(const QRect& row)
+        {
+            return messageRect(row).translated(-24, 0);
+        }
+
+        static bool showsQuickButtons(const QStyleOptionViewItem& option, const QModelIndex& index)
+        {
+            return (option.state & QStyle::State_MouseOver) && index.data(kSocialRole).toBool();
         }
     };
 
@@ -532,6 +586,7 @@ RollbackLobbyDialog::RollbackLobbyDialog(QWidget* parent)
     connect(m_client, &LobbyClient::spectateEnded,        this, &RollbackLobbyDialog::onSpectateEnded);
     connect(m_client, &LobbyClient::spectateFailed,       this, &RollbackLobbyDialog::onSpectateFailed);
     connect(m_client, &LobbyClient::broadcastViewerCount, this, &RollbackLobbyDialog::onBroadcastViewerCount);
+    connectSocialSignals();
 
     // Drains staged krec bytes to the WebSocket while broadcasting. ~80 ms keeps
     // WS frame overhead low without adding meaningful latency to spectators.
@@ -605,6 +660,17 @@ QWidget* RollbackLobbyDialog::buildLobbyView()
     m_roomsStack = new QStackedWidget(container);
     m_roomsStack->addWidget(buildBrowseView());   // index 0
     m_roomsStack->addWidget(buildInRoomView());   // index 1
+    // These float over whichever view is showing.
+    m_roomsStack->installEventFilter(this);
+    m_challengeCard = new ChallengeCard(m_roomsStack);
+    m_challengeCard->setVisible(false);
+    connect(m_challengeCard, &ChallengeCard::acceptClicked, this, [this]() { answerChallenge(true); });
+    connect(m_challengeCard, &ChallengeCard::declineClicked, this, [this]() { answerChallenge(false); });
+    m_toast = new UndoToast(m_roomsStack);
+    connect(m_toast, &UndoToast::undoClicked, this, [this]() {
+        if (!m_undoAction.isEmpty())
+            m_client->sendModAction(m_undoAction, m_undoIp);
+    });
     m_splitter->addWidget(m_roomsStack);
 
     m_splitter->addWidget(buildSidebar());
@@ -705,11 +771,15 @@ QWidget* RollbackLobbyDialog::buildMarquee()
     m_userFlag = new CountryFlag(m_userChip);
     transparentForMouse(m_userFlag);
     sub->addWidget(m_userFlag);
-    auto* guest = new QLabel(tr("Guest"), m_userChip);
-    guest->setFont(LobbyTheme::uiFont(10));
-    guest->setProperty("role", "muted");
-    transparentForMouse(guest);
-    sub->addWidget(guest);
+    m_userRoleIcon = new IconLabel(QStringLiteral("shield-star-fill"), Role::Accent, 11, m_userChip);
+    transparentForMouse(m_userRoleIcon);
+    m_userRoleIcon->setVisible(false);
+    sub->addWidget(m_userRoleIcon);
+    m_userRole = new QLabel(tr("Guest"), m_userChip);
+    m_userRole->setFont(LobbyTheme::uiFont(10));
+    m_userRole->setProperty("role", "muted");
+    transparentForMouse(m_userRole);
+    sub->addWidget(m_userRole);
     sub->addStretch(1);
     who->addLayout(sub);
     chip->addLayout(who);
@@ -720,15 +790,6 @@ QWidget* RollbackLobbyDialog::buildMarquee()
     h->addWidget(m_userChip, 0, Qt::AlignVCenter);
 
     return m_marquee;
-}
-
-void RollbackLobbyDialog::showUserMenu()
-{
-    QMenu menu(this);
-    QAction* rename = menu.addAction(tr("Change username…"));
-    rename->setEnabled(!matchTransportInProgress());
-    if (menu.exec(m_userChip->mapToGlobal(QPoint(0, m_userChip->height()))) == rename)
-        m_client->disconnectFromServer(); // back to the username prompt
 }
 
 void RollbackLobbyDialog::updateUserChip()
@@ -752,6 +813,11 @@ void RollbackLobbyDialog::updateUserChip()
     m_userName->setText(name);
     m_userAvatar->setInitial(name.left(1).toUpper());
     m_userFlag->setCountry(country);
+    const bool moderator = m_client->isModerator();
+    m_userFlag->setVisible(!moderator && !country.isEmpty());
+    m_userRoleIcon->setVisible(moderator);
+    m_userRole->setText(moderator ? tr("Moderator") : tr("Guest"));
+    m_userRole->setStyleSheet(moderator ? QString("color: %1; font-weight: 600;").arg(LobbyTheme::tokens().accentInk.name()) : QString());
 
     const int region = LobbyRegions::regionIndex(m_client->selfRegion());
     if (region >= 0)
@@ -953,6 +1019,7 @@ QWidget* RollbackLobbyDialog::buildBrowseView()
         emit spectateStreamClosed(QStringLiteral("stopped"));
     });
     connect(m_liveGallery, &LiveGallery::contextMenuRequested, this, &RollbackLobbyDialog::showAdminRoomMenu);
+    connect(m_liveGallery, &LiveGallery::playerMenuRequested, this, &RollbackLobbyDialog::showPlayerMenuForName);
     m_browseSplitter->addWidget(m_liveGallery);
 
     m_roomsColumn = new RoomsColumn(this);
@@ -963,6 +1030,7 @@ QWidget* RollbackLobbyDialog::buildBrowseView()
     // estimate until someone actually cares about that room.
     connect(m_roomsColumn, &RoomsColumn::hostProbeRequested, this, &RollbackLobbyDialog::probeOnDemand);
     connect(m_roomsColumn, &RoomsColumn::contextMenuRequested, this, &RollbackLobbyDialog::showAdminRoomMenu);
+    connect(m_roomsColumn, &RoomsColumn::playerMenuRequested, this, &RollbackLobbyDialog::showPlayerMenuForName);
     m_browseSplitter->addWidget(m_roomsColumn);
 
     m_browseSplitter->setStretchFactor(0, 1);
@@ -1268,6 +1336,12 @@ void RollbackLobbyDialog::buildSeatRow(SeatRow& s, int slotIdx, QWidget* parent)
         if (s.userId != 0)
             onAdmitClicked(s.userId);
     });
+
+    s.row->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(s.row, &QWidget::customContextMenuRequested, this, [this, &s](const QPoint& pos) {
+        if (s.userId != 0)
+            showPlayerMenu(s.userId, s.row->mapToGlobal(pos));
+    });
 }
 
 void RollbackLobbyDialog::renderSeatEmpty(SeatRow& s)
@@ -1346,6 +1420,8 @@ QWidget* RollbackLobbyDialog::buildChatColumn()
     auto* card = new LobbyCard(this);
     card->setObjectName("ChatCard");
     card->setMinimumHeight(140);
+    card->installEventFilter(this);
+    m_chatCard = card;
     auto* cardLay = new QVBoxLayout(card);
     cardLay->setContentsMargins(0, 0, 0, 0);
     cardLay->setSpacing(0);
@@ -1355,7 +1431,7 @@ QWidget* RollbackLobbyDialog::buildChatColumn()
     auto* tabLay = new QHBoxLayout(tabRow);
     tabLay->setContentsMargins(8, 8, 8, 0);
     tabLay->setSpacing(0);
-    m_chatTabs = new QTabBar(tabRow);
+    m_chatTabs = new ChatTabBar(tabRow);
     m_chatTabs->setObjectName("ChatTabs");
     m_chatTabs->setDocumentMode(true);
     m_chatTabs->setDrawBase(false);
@@ -1367,6 +1443,10 @@ QWidget* RollbackLobbyDialog::buildChatColumn()
     m_chatTabs->addTab(tr("Lobby").toUpper());
     m_chatTabs->addTab(tr("Room").toUpper());
     m_chatTabs->addTab(tr("Spectators").toUpper());
+    m_chatTabs->addTab(QString());
+    m_chatTabs->setTabVisible(kChatTabMail, false);
+    m_chatTabs->setTabToolTip(kChatTabMail, tr("Private messages"));
+    m_chatTabs->setAccessibleTabName(kChatTabMail, tr("Private messages"));
     m_chatTabs->setTabToolTip(kChatTabLobby, tr("Everyone in the lobby."));
     m_chatTabs->setTabToolTip(kChatTabRoom, tr("Everyone in your room."));
     m_chatTabs->setTabToolTip(kChatTabSpectators,
@@ -1376,32 +1456,35 @@ QWidget* RollbackLobbyDialog::buildChatColumn()
     tabLay->addWidget(m_chatTabs, 1);
     cardLay->addWidget(tabRow);
 
-    auto makeChatView = [](QWidget* parent) {
-        auto* view = new QTextEdit(parent);
-        view->setReadOnly(true);
-        view->setLineWrapMode(QTextEdit::WidgetWidth);
-        view->setFrameShape(QFrame::NoFrame);
-        view->setFont(LobbyTheme::uiFont(12));
-        view->viewport()->setAutoFillBackground(false);
-        keepChatAtBottom(view);
-        return view;
+    // The mail page has its own margins: its header runs edge to edge.
+    const auto wrapChatView = [](ChatView* view) {
+        auto* wrap = new QWidget;
+        auto* wrapLay = new QVBoxLayout(wrap);
+        wrapLay->setContentsMargins(10, 6, 4, 2);
+        wrapLay->addWidget(view);
+        return wrap;
     };
     m_chatStack = new QStackedWidget(card);
-    m_chatViewLobby = makeChatView(m_chatStack);
-    m_chatViewRoom = makeChatView(m_chatStack);
-    m_chatViewSpectate = makeChatView(m_chatStack);
-    m_chatStack->insertWidget(kChatTabLobby, m_chatViewLobby);
-    m_chatStack->insertWidget(kChatTabRoom, m_chatViewRoom);
-    m_chatStack->insertWidget(kChatTabSpectators, m_chatViewSpectate);
-    auto* stackWrap = new QVBoxLayout;
-    stackWrap->setContentsMargins(10, 6, 4, 2);
-    stackWrap->addWidget(m_chatStack);
-    cardLay->addLayout(stackWrap, 1);
+    m_chatViewLobby = new ChatView(m_chatStack);
+    m_chatViewRoom = new ChatView(m_chatStack);
+    m_chatViewSpectate = new ChatView(m_chatStack);
+    m_pmPanel = new PrivateMessagesPanel(m_chatStack);
+    m_chatStack->insertWidget(kChatTabLobby, wrapChatView(m_chatViewLobby));
+    m_chatStack->insertWidget(kChatTabRoom, wrapChatView(m_chatViewRoom));
+    m_chatStack->insertWidget(kChatTabSpectators, wrapChatView(m_chatViewSpectate));
+    m_chatStack->insertWidget(kChatTabMail, m_pmPanel);
+    connectChatView(m_chatViewLobby);
+    connectChatView(m_chatViewRoom);
+    connectChatView(m_chatViewSpectate);
+    cardLay->addWidget(m_chatStack, 1);
 
     connect(m_chatTabs, &QTabBar::currentChanged, this, [this](int index) {
         m_chatStack->setCurrentIndex(index);
-        setChatUnread(index, 0);
+        m_pmPanel->setActive(index == kChatTabMail);
+        setChatUnread(index, index == kChatTabMail ? m_pmPanel->unreadTotal() : 0);
         refreshChatInput();
+        refreshMentionPopup();
+        refreshMentionJump();
     });
 
     auto* compose = new QFrame(card);
@@ -1410,12 +1493,18 @@ QWidget* RollbackLobbyDialog::buildChatColumn()
     auto* composeLay = new QHBoxLayout(compose);
     composeLay->setContentsMargins(11, 0, 4, 0);
     composeLay->setSpacing(8);
+    m_composeAs = new StatusTag(StatusTag::Kind::Neutral, compose);
+    m_composeAs->setVisible(false);
+    composeLay->addWidget(m_composeAs);
     m_chatInput = new QLineEdit(compose);
     m_chatInput->setObjectName("ComposeInput");
     m_chatInput->setFont(LobbyTheme::uiFont(12));
     m_chatInput->setEnabled(false);
     m_chatInput->setMaxLength(500); // server truncates at 500; cap client-side too
+    m_chatInput->installEventFilter(this);
     connect(m_chatInput, &QLineEdit::returnPressed, this, &RollbackLobbyDialog::onChatSendClicked);
+    connect(m_chatInput, &QLineEdit::textChanged, this, [this](const QString&) { refreshMentionPopup(); });
+    connect(m_chatInput, &QLineEdit::cursorPositionChanged, this, [this](int, int) { refreshMentionPopup(); });
     composeLay->addWidget(m_chatInput, 1);
     auto* send = new IconButton(QStringLiteral("send-plane-2-line"), 26, compose);
     send->setToolTip(tr("Send"));
@@ -1427,6 +1516,28 @@ QWidget* RollbackLobbyDialog::buildChatColumn()
     composeWrap->addWidget(compose);
     cardLay->addLayout(composeWrap);
 
+    m_mentionPopup = new MentionPopup(card);
+    connect(m_mentionPopup, &MentionPopup::picked, this, &RollbackLobbyDialog::insertMention);
+    m_mentionJump = new QPushButton(card);
+    m_mentionJump->setObjectName("MentionJump");
+    m_mentionJump->setFont(LobbyTheme::uiFont(11, QFont::DemiBold));
+    m_mentionJump->setCursor(Qt::PointingHandCursor);
+    m_mentionJump->setAutoDefault(false);
+    m_mentionJump->setVisible(false);
+
+    connect(m_pmPanel, &PrivateMessagesPanel::currentChanged, this, &RollbackLobbyDialog::refreshChatInput);
+    connect(m_pmPanel, &PrivateMessagesPanel::unreadChanged, this, [this]() {
+        setChatUnread(kChatTabMail, m_pmPanel->unreadTotal());
+    });
+    connect(m_pmPanel, &PrivateMessagesPanel::userActivated, this, &RollbackLobbyDialog::showPlayerMenu);
+    connect(m_pmPanel, &PrivateMessagesPanel::menuRequested, this, &RollbackLobbyDialog::showPlayerMenu);
+    connect(m_pmPanel, &PrivateMessagesPanel::challengeRequested, this, &RollbackLobbyDialog::startChallenge);
+    connect(m_pmPanel, &PrivateMessagesPanel::newMessageRequested, this, [this]() {
+        m_chatInput->setText(QStringLiteral("/w "));
+        m_chatInput->setFocus();
+    });
+
+    refreshMailTabIcon();
     refreshChatInput();
     return card;
 }
@@ -1435,11 +1546,29 @@ void RollbackLobbyDialog::refreshChatInput()
 {
     if (!m_chatInput || !m_chatTabs)
         return;
+    const bool connected = m_client && m_client->state() == LobbyClient::ConnectionState::Connected;
+    m_chatTabs->setTabVisible(kChatTabMail, connected && m_client->socialSupported());
     const int tab = m_chatTabs->currentIndex();
+    if (tab == kChatTabMail)
+    {
+        const bool open = m_pmPanel->threadOpen();
+        const bool asOther = open && !m_pmPanel->openLocalIsOwner() && !m_pmPanel->openRemoteGone();
+        m_composeAs->setVisible(asOther);
+        if (asOther)
+            m_composeAs->setTag(StatusTag::Kind::Neutral, tr("As %1").arg(m_pmPanel->openLocalName()));
+        m_chatInput->setPlaceholderText(!open ? tr("Type /w and a name to start a conversation")
+            : m_pmPanel->openLocalGone() ? tr("%1 left this PC").arg(m_pmPanel->openLocalName())
+            : m_pmPanel->openRemoteGone() ? tr("%1 left the lobby").arg(m_pmPanel->openRemoteName())
+            : asOther ? tr("Reply…")
+                      : tr("Message %1…").arg(m_pmPanel->openRemoteName()));
+        m_chatInput->setEnabled(connected && !m_pmPanel->openRemoteGone());
+        return;
+    }
+    m_composeAs->setVisible(false);
     m_chatInput->setPlaceholderText(tab == kChatTabSpectators ? tr("Message the other spectators…")
         : tab == kChatTabRoom ? tr("Message the room…")
                               : tr("Message the lobby…"));
-    m_chatInput->setEnabled(m_client && m_client->state() == LobbyClient::ConnectionState::Connected);
+    m_chatInput->setEnabled(connected);
 }
 
 void RollbackLobbyDialog::setChatUnread(int tab, int count)
@@ -1447,6 +1576,8 @@ void RollbackLobbyDialog::setChatUnread(int tab, int count)
     if (tab < 0 || tab >= kChatTabCount)
         return;
     m_chatUnread[tab] = count;
+    if (count <= 0)
+        m_chatMentioned[tab] = false;
     if (count <= 0)
     {
         if (QWidget* old = m_chatTabs->tabButton(tab, QTabBar::RightSide))
@@ -1466,18 +1597,27 @@ void RollbackLobbyDialog::setChatUnread(int tab, int count)
         badge->setAlignment(Qt::AlignCenter);
         m_chatTabs->setTabButton(tab, QTabBar::RightSide, badge);
     }
-    badge->setText(count > 99 ? QStringLiteral("99+") : QString::number(count));
+    badge->setText(m_chatMentioned[tab] ? QStringLiteral("@")
+                   : count > 99 ? QStringLiteral("99+") : QString::number(count));
+    if (badge->property("mention").toBool() != m_chatMentioned[tab])
+    {
+        badge->setProperty("mention", m_chatMentioned[tab]);
+        badge->style()->unpolish(badge);
+        badge->style()->polish(badge);
+    }
     badge->adjustSize();
 }
 
 void RollbackLobbyDialog::setRoomChatVisible(bool visible)
 {
+    // Before hiding: Qt would otherwise move on to the next visible tab, not Lobby.
+    if (!visible && m_chatTabs->currentIndex() == kChatTabRoom)
+        m_chatTabs->setCurrentIndex(kChatTabLobby);
     m_chatTabs->setTabVisible(kChatTabRoom, visible);
     setChatUnread(kChatTabRoom, 0);
+    m_pendingMentions[kChatTabRoom].clear();
     if (visible)
         m_chatTabs->setCurrentIndex(kChatTabRoom);
-    else if (m_chatTabs->currentIndex() == kChatTabRoom)
-        m_chatTabs->setCurrentIndex(kChatTabLobby);
     refreshChatInput();
 }
 
@@ -1547,6 +1687,19 @@ QWidget* RollbackLobbyDialog::buildPlayersColumn()
         return list;
     };
     m_playersTree = makePlayersList();
+    auto* rowButtons = static_cast<PlayersItemDelegate*>(m_playersTree->itemDelegate());
+    rowButtons->onChallenge = [this](quint64 userId) { startChallenge(userId); };
+    rowButtons->onMessage = [this](quint64 userId) { openPrivateMessage(userId); };
+    m_playersTree->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_playersTree, &QWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
+        QTreeWidgetItem* item = m_playersTree->itemAt(pos);
+        if (item && !item->data(0, kGroupRole).toBool())
+            showPlayerMenu(item->data(0, Qt::UserRole).toULongLong(), m_playersTree->viewport()->mapToGlobal(pos));
+    });
+    connect(m_playersTree, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem* item, int) {
+        if (item && item->data(0, kSocialRole).toBool())
+            openPrivateMessage(item->data(0, Qt::UserRole).toULongLong());
+    });
 
     // Your own row stays in view above the list, with this PC's other players.
     m_selfRow = makePlayersList();
@@ -1597,6 +1750,7 @@ void RollbackLobbyDialog::applyStylesheet()
 {
     m_appliedDarkTheme = isDarkTheme();
     setStyleSheet(LobbyTheme::styleSheet());
+    refreshMailTabIcon();
 }
 
 void RollbackLobbyDialog::changeEvent(QEvent* event)
@@ -1781,6 +1935,9 @@ void RollbackLobbyDialog::closeEvent(QCloseEvent* event)
 
 bool RollbackLobbyDialog::eventFilter(QObject* watched, QEvent* event)
 {
+    if (socialEventFilter(watched, event))
+        return true;
+
     // Enter and Escape in the roster's name box stop here: the dialog would press
     // its default button for one and close the lobby for the other.
     if (m_rosterName && watched == m_rosterName && event->type() == QEvent::KeyPress)
@@ -1979,7 +2136,17 @@ void RollbackLobbyDialog::promptForUsername(const QString& statusMessage)
     // doing it here as well makes every reconnect start from a clean lobby.
     clearServerRoomSnapshot();
     updateServerMeta();
-    m_client->connectToServer(m_serverUrl, m_username, {}, QString());
+    // The server compares libraries so a challenge can offer games both players have.
+    // The lobby reads no more than this, and a much longer HELLO wouldn't fit in a message.
+    constexpr int maxRomHashes = 20'000;
+    QStringList romHashes;
+    for (const CoreRomSettings& rom : m_roms)
+    {
+        if (romHashes.size() == maxRomHashes)
+            break;
+        romHashes << QString::fromStdString(rom.MD5);
+    }
+    m_client->connectToServer(m_serverUrl, m_username, romHashes, QString());
 }
 
 bool RollbackLobbyDialog::matchTransportInProgress() const
@@ -2053,6 +2220,7 @@ void RollbackLobbyDialog::onClientStateChanged(LobbyClient::ConnectionState s)
         }
         clearPlayerRows();
         m_quickMatchActive = false;
+        resetSocialState();
 
         if (m_chatViewLobby) m_chatViewLobby->clear();
         if (matchTransportInProgress())
@@ -2224,6 +2392,32 @@ void RollbackLobbyDialog::refreshPlayBar()
         m_ticketAction->setKind(LobbyButton::Kind::Primary);
         m_ticketAction->setIconName(QStringLiteral("arrow-right-line"));
     }
+    else if (m_outgoingChallenge.id != 0)
+    {
+        setTicket(tr("Challenge sent"), t.accentInk, tr("Waiting for %1").arg(m_outgoingChallenge.toUsername),
+                  tr(" · %1 · keep browsing, you'll be moved in if they accept").arg(m_outgoingChallenge.romName));
+        const qint64 left = m_outgoingChallenge.expiresAtMs - QDateTime::currentMSecsSinceEpoch();
+        setValues(QString::number(std::max<qint64>(0, (left + 999) / 1000)), tr("seconds"), QString(), QString());
+        m_ticketBadge->setIconAndColors(QString(), t.accentInk, t.accentTint);
+        m_ticketBadge->setVisible(true);
+        m_ticketSpinner->setColors(t.accentTint, t.accentInk);
+        m_ticketSpinner->setVisible(true);
+        m_ticketAction->setText(tr("Cancel"));
+        m_ticketAction->setKind(LobbyButton::Kind::Secondary);
+        m_ticketAction->setIconName(QStringLiteral("close-line"));
+    }
+    else if (!m_challengeOutcome.title.isEmpty())
+    {
+        setTicket(m_challengeOutcome.title, m_challengeOutcome.color, QString(), m_challengeOutcome.detail);
+        setValues(QString(), QString(), QString(), QString());
+        m_ticketSpinner->setVisible(false);
+        m_ticketBadge->setVisible(true);
+        m_ticketBadge->setIconAndColors(m_challengeOutcome.icon, m_challengeOutcome.color,
+                                        LobbyTheme::mix(m_challengeOutcome.color, t.tint, 0.13));
+        m_ticketAction->setText(tr("OK"));
+        m_ticketAction->setKind(LobbyButton::Kind::Secondary);
+        m_ticketAction->setIconName(QString());
+    }
     else if (m_quickMatchActive)
     {
         setTicket(tr("Searching…"), t.warn, m_searchingGame,
@@ -2278,6 +2472,18 @@ void RollbackLobbyDialog::onPlayBarActionClicked()
     if (m_currentRoomId != 0)
     {
         switchToInRoomView();
+    }
+    else if (m_outgoingChallenge.id != 0)
+    {
+        // Not waiting for the reply: there's none if the challenge has already ended.
+        m_client->cancelChallenge(m_outgoingChallenge.id);
+        m_outgoingChallenge = LobbyClient::Challenge{};
+        refreshPlayBar();
+    }
+    else if (!m_challengeOutcome.title.isEmpty())
+    {
+        m_challengeOutcome.title.clear();
+        refreshPlayBar();
     }
     else if (m_quickMatchActive)
     {
@@ -2374,6 +2580,7 @@ void RollbackLobbyDialog::onUserAdded(quint64 userId)
 
 void RollbackLobbyDialog::onUserRemoved(quint64 userId)
 {
+    m_pmPanel->markGone(userId);
     auto it = m_userItems.find(userId);
     if (it == m_userItems.end()) return;
     delete it.value();
@@ -2391,6 +2598,7 @@ void RollbackLobbyDialog::onUserUpdated(quint64 userId)
     if (userIt == users.constEnd()) return;
     refreshPlayerRow(it.value(), userIt.value());
     refreshPlayerGroups();
+    refreshPrivateMessageStatus(userId);
     if (userId == m_client->selfUserId())
         updateUserChip();
     for (auto& seat : m_seats)
@@ -2533,6 +2741,7 @@ void RollbackLobbyDialog::refreshPlayerRow(QTreeWidgetItem* item, const LobbyCli
     item->setData(0, kPingMsRole, effective);
     item->setData(0, kPingEstimateRole, measured < 0);
     item->setData(0, kConnectionTypeRole, u.connection);
+    item->setData(0, kSocialRole, !isSelf && u.social && m_client->socialSupported());
 
     // Built as lines so an absent field just doesn't contribute, rather than
     // leaving a stray separator. The region is deliberately not among them: it's
@@ -2646,6 +2855,9 @@ void RollbackLobbyDialog::onRoomListChanged()
             if (!r.lateJoin)
                 continue;
         }
+        // Made for a challenge, so there's nothing here for anyone else to join.
+        if (r.privateRoom)
+            continue;
 
         RoomRowView room;
         room.roomId = r.id;
@@ -2760,8 +2972,8 @@ void RollbackLobbyDialog::showAdminRoomMenu(quint64 roomId, const QPoint& global
     if (room == m_client->rooms().constEnd())
         return;
 
-    QMenu menu(this);
-    QAction* closeAction = menu.addAction(room->state == QLatin1String("in_game")
+    LobbyMenu menu(this);
+    QAction* closeAction = menu.addDangerItem(QStringLiteral("close-circle-line"), room->state == QLatin1String("in_game")
         ? tr("End match && close room  (moderator)")
         : tr("Close room  (moderator)"));
     if (menu.exec(globalPos) != closeAction)
@@ -2871,6 +3083,8 @@ void RollbackLobbyDialog::onRoomJoinFailed(const QString& reason)
         tr("You were recently removed from this room. Try again in a moment.");
     else if (reason == "not_enough_seats") human =
         tr("That room doesn't have a free seat for everyone on this PC.");
+    else if (reason == "private_room") human =
+        tr("That room is private.");
     else if (reason == "needs_update") human =
         tr("That room needs a newer version of RMG-K.");
     else if (reason == "peer_needs_update") human =
@@ -3138,6 +3352,8 @@ void RollbackLobbyDialog::onRoomStateChanged(const QJsonObject& roomState)
             parts << romName;
         if (!romRegion.isEmpty())
             parts << romRegion;
+        if (roomState.value("private").toBool())
+            parts << tr("Private");
         parts << (state == "in_game" ? tr("in game")
                                      : tr("%1 of %2 seats").arg(players.size()).arg(maxPlayers));
         parts << (iAmHost ? tr("hosted by you") : tr("host %1").arg(m_currentRoomHostName));
@@ -4188,6 +4404,16 @@ void RollbackLobbyDialog::onChatSendClicked()
         : tab == kChatTabRoom && m_currentRoomId != 0 ? CHANNEL_ROOM
                                                       : CHANNEL_LOBBY;
     if (handleSlashCommand(channel, text)) { m_chatInput->clear(); return; }
+    if (tab == kChatTabMail)
+    {
+        // With no thread open there's nobody to send it to; keep what they typed.
+        if (m_pmPanel->threadOpen())
+        {
+            sendCurrentPrivateMessage(text);
+            m_chatInput->clear();
+        }
+        return;
+    }
     if (channel == QLatin1String(CHANNEL_SPECTATE))
         sendSpectatorChat(text);
     else if (channel == QLatin1String(CHANNEL_ROOM))
@@ -4199,6 +4425,24 @@ void RollbackLobbyDialog::onChatSendClicked()
 
 void RollbackLobbyDialog::onChatMessageReceived(const LobbyClient::ChatMessage& msg)
 {
+    if (msg.channel == QLatin1String("pm"))
+    {
+        onPrivateMessage(msg);
+        return;
+    }
+
+    // A moderator always gets through, so a warning can't be ignored away.
+    if (!msg.fromAdmin && !m_client->isOnThisPc(msg.fromUserId) && isIgnored(msg.fromUsername))
+        return;
+
+    bool mentionsMe = false;
+    const auto lineFor = [&](const QString& message) {
+        const auto ts = QDateTime::fromMSecsSinceEpoch(msg.serverTimeMs).toString("hh:mm");
+        QString line = chatMessageHtml(ts, msg.fromUserId, msg.fromUsername, chatBodyHtml(message, &mentionsMe), msg.fromAdmin);
+        mentionsMe = mentionsMe && msg.fromUserId != 0 && !m_client->isOnThisPc(msg.fromUserId);
+        return mentionsMe ? chatMentionLineHtml(line) : line;
+    };
+
     if (msg.channel == CHANNEL_SPECTATE)
     {
         // Chat among the viewers of the live replay we're watching, shown in
@@ -4206,8 +4450,9 @@ void RollbackLobbyDialog::onChatMessageReceived(const LobbyClient::ChatMessage& 
         // dropped.
         if (m_spectatingMatchId == 0)
             return;
-        const auto ts = QDateTime::fromMSecsSinceEpoch(msg.serverTimeMs).toString("hh:mm");
-        appendChatLine(CHANNEL_SPECTATE, chatMessageHtml(ts, msg.fromUsername, msg.message));
+        appendChatLine(CHANNEL_SPECTATE, lineFor(msg.message));
+        if (mentionsMe)
+            noteMention(CHANNEL_SPECTATE, msg);
         emit spectatorChatReceived(msg.fromUsername, msg.message);
         return;
     }
@@ -4232,8 +4477,7 @@ void RollbackLobbyDialog::onChatMessageReceived(const LobbyClient::ChatMessage& 
             displayMessage = tr("📣 Attention!");
     }
 
-    const auto ts = QDateTime::fromMSecsSinceEpoch(msg.serverTimeMs).toString("hh:mm");
-    QString line = chatMessageHtml(ts, msg.fromUsername, displayMessage);
+    QString line = lineFor(displayMessage);
     if (notifyPing)
     {
         // Full-width bar via a one-cell table (QTextEdit's rich-text subset
@@ -4243,6 +4487,8 @@ void RollbackLobbyDialog::onChatMessageReceived(const LobbyClient::ChatMessage& 
                        "<tr><td style=\"color:#000000;\">%1</td></tr></table>").arg(line);
     }
     appendChatLine(msg.channel, line);
+    if (mentionsMe)
+        noteMention(msg.channel, msg);
 
     if (notifyPing && m_client && msg.fromUserId != m_client->selfUserId())
     {
@@ -4291,17 +4537,26 @@ void RollbackLobbyDialog::sendSpectatorChat(const QString& message)
     m_client->sendChat(CHANNEL_SPECTATE, text);
 }
 
-QString RollbackLobbyDialog::chatMessageHtml(const QString& time, const QString& who, const QString& message) const
+QString RollbackLobbyDialog::chatMessageHtml(const QString& time, quint64 userId, const QString& who,
+                                             const QString& bodyHtml, bool fromAdmin, bool mine) const
 {
     const Tokens& t = LobbyTheme::tokens();
-    return QString("<span style='color:%1; font-size:9px;'>%2</span>&nbsp; "
-                   "<b style='color:%3;'>%4</b> %5")
-        .arg(t.muted.name(), time, t.ink.name(), who.toHtmlEscaped(), message.toHtmlEscaped());
+    const QString color = mine ? t.accentInk.name() : t.ink.name();
+    QString name = QString("<b style='color:%1;'>%2</b>").arg(color, who.toHtmlEscaped());
+    // Someone else's name opens their menu. Server notices have no user behind them.
+    if (userId != 0 && !m_client->isOnThisPc(userId))
+        name = QString("<a href='%1' style='color:%2; text-decoration:none;'>%3</a>")
+            .arg(ChatView::userHref(userId), color, name);
+    const QString shield = fromAdmin
+        ? chatIconHtml(QStringLiteral("shield-star-fill"), t.accentInk, 12) + QStringLiteral("&nbsp;")
+        : QString();
+    return QString("<span style='color:%1; font-size:9px;'>%2</span>&nbsp; %3%4 %5")
+        .arg(t.muted.name(), time, shield, name, bodyHtml);
 }
 
 void RollbackLobbyDialog::appendChatLine(const QString& channel, const QString& text)
 {
-    QTextEdit* target = m_chatViewLobby;
+    ChatView* target = m_chatViewLobby;
     int tab = kChatTabLobby;
     if (channel == CHANNEL_ROOM && m_chatViewRoom)
     {
@@ -4315,13 +4570,7 @@ void RollbackLobbyDialog::appendChatLine(const QString& channel, const QString& 
     }
     if (!target)
         return;
-    target->append(text);
-
-    // Breathing room between messages.
-    QTextCursor cursor(target->document()->lastBlock());
-    QTextBlockFormat format = cursor.blockFormat();
-    format.setBottomMargin(5);
-    cursor.setBlockFormat(format);
+    target->addLine(text);
 
     if (m_chatTabs && tab != m_chatTabs->currentIndex() && m_chatTabs->isTabVisible(tab))
         setChatUnread(tab, m_chatUnread[tab] + 1);
@@ -4335,16 +4584,8 @@ void RollbackLobbyDialog::appendChatSystemLine(const QString& channel, const QSt
     QString mark;
     if (!icon.isEmpty())
     {
-        // The document needs each tinted icon registered under a name of its own.
         const QColor color = role == Role::Muted ? t.muted : LobbyTheme::roleColor(role);
-        const QString name = QString("lobby-icon://%1/%2").arg(icon, color.name().mid(1));
-        const QPixmap pixmap = LobbyTheme::icon(icon, color, 13, devicePixelRatioF());
-        for (QTextEdit* view : { m_chatViewLobby, m_chatViewRoom, m_chatViewSpectate })
-        {
-            if (view)
-                view->document()->addResource(QTextDocument::ImageResource, QUrl(name), pixmap);
-        }
-        mark = QString("<img src='%1' width='13' height='13' style='vertical-align:middle;'>&nbsp;").arg(name);
+        mark = chatIconHtml(icon, color, 13) + QStringLiteral("&nbsp;");
     }
     appendChatLine(channel, QString("<span style='color:%1; font-size:9px;'>%2</span>&nbsp; %3"
                                     "<i style='color:%1;'>%4</i>")
@@ -4362,6 +4603,48 @@ bool RollbackLobbyDialog::handleSlashCommand(const QString& channel, const QStri
     const QString cmd = parts[0].toLower();
 
     auto sysline = [&](const QString& s) { appendChatSystemLine(channel, s); };
+
+    if ((cmd == "/w" || cmd == "/pm" || cmd == "/r") && m_client->socialSupported())
+    {
+        const bool reply = cmd == "/r";
+        if (reply && m_lastPmRemote == 0)
+        {
+            sysline(tr("There's nobody to reply to yet."));
+            return true;
+        }
+        if (!reply && parts.size() < 2)
+        {
+            sysline(tr("Usage: /w &lt;player&gt; [message]"));
+            return true;
+        }
+        const quint64 target = reply ? m_lastPmRemote : userIdForName(parts[1]);
+        const auto user = m_client->users().constFind(target);
+        if (target == 0 || user == m_client->users().constEnd())
+        {
+            sysline(reply ? tr("They've left the lobby.")
+                          : tr("Nobody called %1 is here.").arg(parts[1].toHtmlEscaped()));
+            return true;
+        }
+        if (m_client->isOnThisPc(target))
+        {
+            sysline(tr("They're on this PC."));
+            return true;
+        }
+        if (reply && !m_client->isOnThisPc(m_lastPmLocal))
+        {
+            sysline(tr("Whoever they wrote to has left this PC."));
+            return true;
+        }
+        if (reply)
+            m_pmPanel->openThread(m_lastPmLocal, target);
+        else
+            openPrivateMessage(target);
+        m_chatTabs->setCurrentIndex(kChatTabMail);
+        const QStringList words = parts.mid(reply ? 1 : 2);
+        if (!words.isEmpty())
+            sendCurrentPrivateMessage(words.join(QLatin1Char(' ')));
+        return true;
+    }
 
     // /login is always intercepted (even with trailing text) so a password typed
     // inline is never sent to chat. The password is collected via a masked modal.
@@ -4452,7 +4735,9 @@ void RollbackLobbyDialog::onAdminAuthResult(bool ok, const QString& nameOrReason
 {
     if (ok)
     {
-        const QString line = tr("✓ Moderator access granted (%1). Type /modhelp for commands.")
+        m_moderatorName = nameOrReason;
+        updateUserChip();
+        const QString line = tr("✓ Moderator access granted (%1). Right-click a player to moderate, or type /modhelp.")
             .arg(nameOrReason.toHtmlEscaped());
         appendChatSystemLine(CHANNEL_LOBBY, line);
         appendChatSystemLine(CHANNEL_ROOM, line);
@@ -4473,6 +4758,12 @@ void RollbackLobbyDialog::onModNotice(const QString& severity, const QString& te
 
 void RollbackLobbyDialog::onModListReceived(const QJsonArray& bans, const QJsonArray& mutes)
 {
+    if (m_moderationDialog && m_moderationDialog->isVisible())
+    {
+        m_moderationDialog->setSanctions(bans, mutes);
+        return;
+    }
+
     auto fmt = [](const QJsonArray& arr, const QString& kind) -> QStringList {
         QStringList lines;
         for (const auto& v : arr)
@@ -5057,12 +5348,14 @@ void RollbackLobbyDialog::stopSpectating()
 
 void RollbackLobbyDialog::setSpectatorChatVisible(bool visible)
 {
+    // Before hiding: Qt would otherwise move on to the next visible tab, not Lobby.
+    if (!visible && m_chatTabs->currentIndex() == kChatTabSpectators)
+        m_chatTabs->setCurrentIndex(kChatTabLobby);
     m_chatTabs->setTabVisible(kChatTabSpectators, visible);
     setChatUnread(kChatTabSpectators, 0);
+    m_pendingMentions[kChatTabSpectators].clear();
     if (visible)
         m_chatTabs->setCurrentIndex(kChatTabSpectators);
-    else if (m_chatTabs->currentIndex() == kChatTabSpectators)
-        m_chatTabs->setCurrentIndex(kChatTabLobby);
     refreshChatInput();
 }
 

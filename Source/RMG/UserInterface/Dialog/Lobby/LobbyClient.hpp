@@ -68,6 +68,7 @@ public:
         quint64 currentRoomId = 0;
         QString currentRoomName;
         QString searchingRom;    // ROM the user is queued for while state == searching
+        bool social = false;     // can receive private messages and challenges
     };
 
     struct LobbyRoomSummary
@@ -88,6 +89,7 @@ public:
         quint64 matchId = 0;          // current match id (set only while broadcasting)
         int viewerCount = 0;
         bool lateJoin = false;        // in game with a free seat a late joiner may take
+        bool privateRoom = false;     // made for a challenge; nobody else can join
     };
 
     struct LobbyMatchPeer
@@ -123,6 +125,28 @@ public:
         // Sender was a server-authenticated moderator when this was sent.
         // Old servers never send the field, so it stays false.
         bool fromAdmin = false;
+        // Private messages only: who it's for, this client or one of its local
+        // players when it was sent to this PC.
+        quint64 toUserId = 0;
+        QString toUsername;
+    };
+
+    // A request to play: to a new private room, or an invite to the sender's room.
+    struct Challenge
+    {
+        quint64 id = 0;
+        quint64 fromUserId = 0;
+        QString fromUsername;
+        quint64 toUserId = 0;
+        QString toUsername;
+        QString romName;
+        QString romMd5;
+        QString note;
+        qint64 expiresAtMs = 0; // this PC's clock
+        bool invite = false;
+        QString roomName;
+        int roomPlayers = 0;
+        int roomMaxPlayers = 0;
     };
 
     explicit LobbyClient(QObject* parent = nullptr);
@@ -166,6 +190,20 @@ public:
     // Chat
     void sendChat(const QString& channel, const QString& message);
     void requestChatHistory(const QString& channel);
+    // asUserId picks who on this PC is talking; zero is this client's own user.
+    void sendPrivateMessage(quint64 toUserId, quint64 asUserId, const QString& message);
+
+    // Private messages and challenges work on this server.
+    bool socialSupported() const { return m_socialSupported; }
+
+    // Challenges. From inside a room the server makes this an invite to it and
+    // ignores the ROM.
+    void sendChallenge(quint64 toUserId, const QString& romName, const QString& romMd5,
+                       const QString& note, bool liveReplay);
+    void cancelChallenge(quint64 challengeId);
+    void respondToChallenge(quint64 challengeId, bool accept);
+    // Which of this client's games a player also has; answered by sharedGamesReceived.
+    void requestSharedGames(quint64 toUserId);
 
     // Rooms
     void createRoom(const QString& name, const QString& romName, const QString& romMd5,
@@ -268,7 +306,10 @@ public:
     void sendAdminAuth(const QString& password);
     void sendModAction(const QString& action, const QString& target,
                        const QString& duration = QString(), const QString& reason = QString());
+    void sendAdminLogout();
     bool isModerator() const { return m_isModerator; }
+    // Users the server won't let a moderator act on. Only known while moderating.
+    bool isModeratorUser(quint64 userId) const { return m_moderatorUsers.contains(userId); }
 
     // Legacy UDP-anchor compatibility API. ICE-capable rollback-lobby matches
     // do not call these; they remain for compatibility with older servers.
@@ -321,6 +362,14 @@ signals:
 
     void chatMessageReceived(const LobbyClient::ChatMessage& msg);
     void chatHistoryReceived(const QString& channel, const QList<LobbyClient::ChatMessage>& msgs);
+    // A private message went nowhere; reason is the server's CHAT_FAIL reason.
+    void privateMessageFailed(quint64 toUserId, const QString& reason);
+
+    void challengeSent(const LobbyClient::Challenge& challenge);
+    void challengeIncoming(const LobbyClient::Challenge& challenge);
+    // A challenge ended, or a send was refused (challengeId 0).
+    void challengeEnded(quint64 challengeId, quint64 toUserId, const QString& result);
+    void sharedGamesReceived(quint64 toUserId, const QStringList& md5s);
 
     void pingProbeReply(quint64 targetUserId, const QString& endpoint);
     void pingProbeMeasured(quint64 targetUserId, int rttMs);
@@ -381,6 +430,11 @@ signals:
     void adminAuthResult(bool ok, const QString& nameOrReason); // ok => moderator granted, name; else reason
     void modNotice(const QString& severity, const QString& text); // system notice ("info"/"warn"/"error")
     void modListReceived(const QJsonArray& bans, const QJsonArray& mutes); // reply to "list"
+    void adminLoggedOut();
+    // A kick, mute, timeout or ban took effect. ip is what undoing it takes.
+    void modResult(const QString& action, const QString& target, const QString& ip, qint64 untilMs);
+    void modTargetInfo(const QString& target, const QStringList& others, bool moderator); // reply to "inspect"
+    void moderatorsChanged();
 
 private slots:
     void onWsConnected();
@@ -416,6 +470,11 @@ private:
     void handleRoomLeft(const QJsonObject& data);
     void handleChatMsg(const QJsonObject& data);
     void handleChatHistoryReply(const QJsonObject& data);
+    void handleChatFail(const QJsonObject& data);
+    void handleChallengeSent(const QJsonObject& data);
+    void handleChallengeIncoming(const QJsonObject& data);
+    void handleChallengeResult(const QJsonObject& data);
+    void handleChallengeGamesReply(const QJsonObject& data);
     void handlePingProbeReply(const QJsonObject& data);
     void handleMatchBegin(const QJsonObject& data);
     void handlePingProbeIncoming(const QJsonObject& data);
@@ -469,6 +528,10 @@ private:
     void handleAdminAuthFail(const QJsonObject& data);
     void handleModNotice(const QJsonObject& data);
     void handleModList(const QJsonObject& data);
+    void handleAdminLoggedOut();
+    void handleModResult(const QJsonObject& data);
+    void handleModTargetInfo(const QJsonObject& data);
+    void handleModPeers(const QJsonObject& data);
 
     void initiateUdpAnchor();
     // Stop Windows from failing receives with WSAECONNRESET when a peer's port
@@ -501,6 +564,7 @@ private:
     QByteArray m_prematchManifest;
     int m_matchSeats = 0;
 
+    bool m_socialSupported = false;
     bool m_localPlayersSupported = false;
     QList<LocalPlayer> m_localPlayers;
     QHash<QString, int> m_pendingLocalControllers; // asked for, by name, until the server answers
@@ -554,6 +618,7 @@ private:
     QString m_observedIp;
     QString m_region;
     bool    m_isModerator = false; // set once ADMIN_AUTH_OK is received
+    QSet<quint64> m_moderatorUsers; // from MOD_PEERS, while moderating
     qint64  m_broadcastKeyframeIntervalMs = 30'000;
     quint64 m_currentIceRoomId = 0;
     quint64 m_currentIceHostUserId = 0;

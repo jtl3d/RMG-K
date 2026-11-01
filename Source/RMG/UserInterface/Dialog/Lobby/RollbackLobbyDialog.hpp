@@ -16,6 +16,7 @@
 #include <QHash>
 #include <QList>
 #include <QMap>
+#include <QPointer>
 #include <QSet>
 #include <QStringList>
 #include <QByteArray>
@@ -48,6 +49,8 @@ namespace Dialog
 {
 
 class CartridgeTile;
+class ChallengeCard;
+class ChatView;
 class CountryFlag;
 class ElidedLabel;
 class FrameStepper;
@@ -58,12 +61,16 @@ class LiveGallery;
 class LobbyBand;
 class LobbyButton;
 class LobbyCard;
+class MentionPopup;
+class ModerationDialog;
 class PortCard;
+class PrivateMessagesPanel;
 class RoomsColumn;
 class Spinner;
 class StatePill;
 class StatusTag;
 class ToggleSwitch;
+class UndoToast;
 class UserAvatar;
 
 // Top-level rollback lobby UI. Owns a LobbyClient and renders presence /
@@ -289,6 +296,63 @@ private:
     void refreshPlayerGroups();
     // Right-click menu on rooms and matches; moderator-only "closeroom".
     void showAdminRoomMenu(quint64 roomId, const QPoint& globalPos);
+
+    // ── Social (RollbackLobbySocial.cpp) ──
+    // The menu on any player's name, everywhere a name appears.
+    void showPlayerMenu(quint64 userId, const QPoint& globalPos);
+    void showPlayerMenuForName(const QString& name, const QPoint& globalPos);
+    quint64 userIdForName(const QString& name) const;
+    void connectChatView(ChatView* view);
+    void connectSocialSignals();
+    void resetSocialState();
+    bool socialEventFilter(QObject* watched, QEvent* event);
+    void refreshMailTabIcon();
+    // Anything that plays a sound or flashes the taskbar goes through this, so
+    // Do not disturb and the per-sender limit apply to all of it.
+    void alertFrom(quint64 userId);
+
+    // Ignoring is per name and per PC; the server isn't involved.
+    bool isIgnored(const QString& name) const;
+    void setIgnored(const QString& name, bool ignored);
+    void showIgnoredPlayers();
+
+    // Challenges
+    void startChallenge(quint64 userId);
+    void onChallengeSent(const LobbyClient::Challenge& challenge);
+    void onChallengeIncoming(const LobbyClient::Challenge& challenge);
+    void onChallengeEnded(quint64 challengeId, quint64 toUserId, const QString& result);
+    void showNextChallenge();
+    void answerChallenge(bool accept);
+    void expireChallengeLater(quint64 challengeId, qint64 expiresAtMs);
+    void setChallengeOutcome(const QString& title, const QString& detail, const QColor& color, const QString& icon);
+    void stopWatchingForRoom();
+    void positionStageOverlays();
+
+    // Private messages
+    void openPrivateMessage(quint64 userId);
+    void onPrivateMessage(const LobbyClient::ChatMessage& msg);
+    void onPrivateMessageFailed(quint64 toUserId, const QString& reason);
+    void refreshPrivateMessageStatus(quint64 userId);
+    void sendCurrentPrivateMessage(const QString& text);
+
+    // Mentions
+    // A message as chat HTML: escaped, with @names as links. mentionsMe says
+    // whether it names someone on this PC.
+    QString chatBodyHtml(const QString& message, bool* mentionsMe) const;
+    QString chatMentionLineHtml(const QString& line) const;
+    void    noteMention(const QString& channel, const LobbyClient::ChatMessage& msg);
+    void    startMention(const QString& name);
+    void    refreshMentionPopup();
+    void    insertMention(const QString& name);
+    void    refreshMentionJump();
+    void    positionChatOverlays();
+    // An icon inside a chat line; registers it with every chat view's document.
+    QString chatIconHtml(const QString& icon, const QColor& color, int px) const;
+
+    // Moderation
+    void openSanctionDialog(bool ban, const QString& name);
+    void showModerationDialog();
+    void onModResult(const QString& action, const QString& target, const QString& ip, qint64 untilMs);
     // Ticks the running durations once a second.
     void updateMatchDurations();
 
@@ -297,7 +361,10 @@ private:
     void    appendChatSystemLine(const QString& channel, const QString& text,
                                  const QString& icon = QString(),
                                  LobbyTheme::Role role = LobbyTheme::Role::Muted);
-    QString chatMessageHtml(const QString& time, const QString& who, const QString& message) const;
+    // One line of chat. bodyHtml is from chatBodyHtml. mine marks this PC's own
+    // lines in a private conversation.
+    QString chatMessageHtml(const QString& time, quint64 userId, const QString& who, const QString& bodyHtml,
+                            bool fromAdmin, bool mine = false) const;
     void    refreshChatInput();
     void    setChatUnread(int tab, int count);
     void    setRoomChatVisible(bool visible);
@@ -421,6 +488,8 @@ private:
     UserAvatar*  m_userAvatar = nullptr;
     QLabel*      m_userName = nullptr;
     CountryFlag* m_userFlag = nullptr;
+    IconLabel*   m_userRoleIcon = nullptr;
+    QLabel*      m_userRole = nullptr;
 
     // ── Main panels ──
     QSplitter*   m_splitter      = nullptr;
@@ -462,14 +531,58 @@ private:
     LiveGallery* m_liveGallery   = nullptr;
     RoomsColumn* m_roomsColumn   = nullptr;
     QTimer*      m_matchDurationTimer = nullptr;
-    QTextEdit*   m_chatViewLobby = nullptr;
-    QTextEdit*   m_chatViewRoom  = nullptr; // room chat, the Room tab
-    QTextEdit*   m_chatViewSpectate = nullptr; // spectators' chat while watching
-    QTabBar*     m_chatTabs      = nullptr; // Lobby | Room | Spectators
+    ChatView*    m_chatViewLobby = nullptr;
+    ChatView*    m_chatViewRoom  = nullptr; // room chat, the Room tab
+    ChatView*    m_chatViewSpectate = nullptr; // spectators' chat while watching
+    QTabBar*     m_chatTabs      = nullptr; // Lobby | Room | Spectators | mail
     QStackedWidget* m_chatStack  = nullptr; // one view per tab
     QLineEdit*   m_chatInput     = nullptr; // sends to the selected tab
-    static constexpr int kChatTabCount = 3;
+    QWidget*     m_chatCard      = nullptr;
+    StatusTag*   m_composeAs     = nullptr; // who on this PC a private reply is from
+    // Room only shows while seated, Spectators only while watching, mail only on
+    // a server that relays private messages.
+    enum ChatTab { kChatTabLobby, kChatTabRoom, kChatTabSpectators, kChatTabMail, kChatTabCount };
     int          m_chatUnread[kChatTabCount] = {};
+    bool         m_chatMentioned[kChatTabCount] = {}; // an unseen line in that tab names this PC
+    // Lines naming this PC below where the reader has scrolled, as block numbers.
+    QList<int>   m_pendingMentions[kChatTabCount];
+    MentionPopup* m_mentionPopup = nullptr;
+    QPushButton* m_mentionJump   = nullptr;
+    PrivateMessagesPanel* m_pmPanel = nullptr;
+    quint64      m_lastPmLocal   = 0; // who /r answers: this PC's side...
+    quint64      m_lastPmRemote  = 0; // ...and theirs
+
+    QStringList  m_ignored;
+    bool         m_doNotDisturb = false;
+    QHash<quint64, qint64> m_lastAlertMs; // per sender
+
+    // ── Challenges ──
+    ChallengeCard* m_challengeCard = nullptr;
+    QList<LobbyClient::Challenge> m_incomingChallenges; // the first is on the card
+    LobbyClient::Challenge m_outgoingChallenge;         // id 0 when there's none
+    QPointer<QDialog> m_challengeDialog;
+    QPointer<QDialog> m_sanctionDialog;
+    QString      m_challengeTargetName;
+    // What this PC last said yes to, for the line in the room chat once it's in.
+    quint64      m_acceptedChallengeId = 0;
+    QString      m_acceptedChallengeFrom;
+    bool         m_acceptedChallengeInvite = false;
+    struct ChallengeOutcome
+    {
+        QString title;
+        QString detail;
+        QColor color;
+        QString icon;
+        int generation = 0;
+    };
+    ChallengeOutcome m_challengeOutcome; // shown on the play bar until dismissed
+
+    // ── Moderation ──
+    UndoToast*   m_toast = nullptr;
+    ModerationDialog* m_moderationDialog = nullptr;
+    QString      m_moderatorName;
+    QString      m_undoAction;
+    QString      m_undoIp;
     bool         m_appliedDarkTheme = false;
 
     // ── Stacked browse / in-room view ──

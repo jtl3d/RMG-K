@@ -101,6 +101,8 @@ signals:
     void stopWatchingRequested();
     void joinRequested(quint64 roomId);
     void contextMenuRequested(quint64 roomId, const QPoint& globalPos);
+    // A right-click on a player's name in a card.
+    void playerMenuRequested(const QString& name, const QPoint& globalPos);
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -156,6 +158,8 @@ signals:
     // A row was clicked; the dialog measures the ping to its host.
     void hostProbeRequested(quint64 hostId);
     void contextMenuRequested(quint64 roomId, const QPoint& globalPos);
+    // A right-click on a host's name in a row.
+    void playerMenuRequested(const QString& name, const QPoint& globalPos);
 
 private:
     enum class Sort { Default, Ping, Players, Name };

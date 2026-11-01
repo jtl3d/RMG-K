@@ -85,6 +85,22 @@ namespace
 
 // ── Match cards ──────────────────────────────────────────────────────
 
+namespace
+{
+    // Whose name, if anyone's, is under pos. The widgets showing one carry it in
+    // a "playerName" property.
+    QString playerNameAt(QWidget* root, const QPoint& pos)
+    {
+        for (QWidget* widget = root->childAt(pos); widget && widget != root; widget = widget->parentWidget())
+        {
+            const QVariant name = widget->property("playerName");
+            if (name.isValid())
+                return name.toString();
+        }
+        return QString();
+    }
+} // namespace
+
 // Chrome and behaviour shared by the regular and the featured card.
 class MatchCardBase : public QFrame
 {
@@ -113,6 +129,7 @@ signals:
     void stopWatchingRequested();
     void joinRequested(quint64 roomId);
     void contextMenuRequested(quint64 roomId, const QPoint& globalPos);
+    void playerMenuRequested(const QString& name, const QPoint& globalPos);
 
 protected:
     bool canWatch() const
@@ -225,7 +242,11 @@ protected:
 
     void contextMenuEvent(QContextMenuEvent* event) override
     {
-        emit contextMenuRequested(m_view.roomId, event->globalPos());
+        const QString player = playerNameAt(this, event->pos());
+        if (!player.isEmpty())
+            emit playerMenuRequested(player, event->globalPos());
+        else
+            emit contextMenuRequested(m_view.roomId, event->globalPos());
     }
 
     LiveMatchView m_view;
@@ -257,6 +278,7 @@ public:
         m_name->setFont(LobbyTheme::uiFont(compact ? 12 : 13, QFont::DemiBold));
         m_name->setText(player.name);
         m_name->setToolTip(player.name);
+        setProperty("playerName", player.name);
         m_flag->setCountry(compact ? QString() : player.country);
     }
 
@@ -556,6 +578,7 @@ public:
             const bool known = i < view.players.size();
             m_sideNames[i]->setText(known ? view.players.at(i).name : QString());
             m_sideNames[i]->setToolTip(m_sideNames[i]->text());
+            m_sideNames[i]->setProperty("playerName", m_sideNames[i]->text());
             m_sideFlags[i]->setCountry(known ? view.players.at(i).country : QString());
         }
         m_viewers->setText(QString::number(view.viewers));
@@ -714,6 +737,7 @@ void LiveGallery::connectCard(MatchCardBase* card)
     connect(card, &MatchCardBase::stopWatchingRequested, this, &LiveGallery::stopWatchingRequested);
     connect(card, &MatchCardBase::joinRequested, this, &LiveGallery::joinRequested);
     connect(card, &MatchCardBase::contextMenuRequested, this, &LiveGallery::contextMenuRequested);
+    connect(card, &MatchCardBase::playerMenuRequested, this, &LiveGallery::playerMenuRequested);
 }
 
 void LiveGallery::setMatches(const QList<LiveMatchView>& matches)
@@ -1042,6 +1066,7 @@ public:
         m_game->setToolTip(view.game);
         m_flag->setCountry(view.hostCountry);
         m_host->setText(view.host);
+        m_host->setProperty("playerName", view.host);
         m_pips->setSeats(view.players, view.maxPlayers);
         m_seats->setText(QString("%1/%2").arg(view.players).arg(view.maxPlayers));
         m_bars->setPing(view.pingMs, !view.pingMeasured);
@@ -1112,6 +1137,7 @@ signals:
     void returnRequested();
     void clicked(quint64 roomId);
     void contextMenuRequested(quint64 roomId, const QPoint& globalPos);
+    void playerMenuRequested(const QString& name, const QPoint& globalPos);
 
 protected:
     void paintEvent(QPaintEvent*) override
@@ -1153,7 +1179,11 @@ protected:
 
     void contextMenuEvent(QContextMenuEvent* event) override
     {
-        emit contextMenuRequested(m_view.roomId, event->globalPos());
+        const QString player = playerNameAt(this, event->pos());
+        if (!player.isEmpty())
+            emit playerMenuRequested(player, event->globalPos());
+        else
+            emit contextMenuRequested(m_view.roomId, event->globalPos());
     }
 
 private:
@@ -1398,6 +1428,7 @@ void RoomsColumn::rebuild()
             connect(row, &RoomRow::joinRequested, this, &RoomsColumn::joinRequested);
             connect(row, &RoomRow::returnRequested, this, &RoomsColumn::returnRequested);
             connect(row, &RoomRow::contextMenuRequested, this, &RoomsColumn::contextMenuRequested);
+            connect(row, &RoomRow::playerMenuRequested, this, &RoomsColumn::playerMenuRequested);
             connect(row, &RoomRow::clicked, this, [this](quint64 roomId) {
                 selectRow(roomId);
                 const auto it = m_rows.constFind(roomId);

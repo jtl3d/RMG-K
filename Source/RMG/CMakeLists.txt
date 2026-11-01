@@ -126,9 +126,12 @@ if (NETPLAY)
         UserInterface/Dialog/Lobby/LobbyTheme.cpp
         UserInterface/Dialog/Lobby/LobbyWidgets.cpp
         UserInterface/Dialog/Lobby/LobbyBrowsePanels.cpp
+        UserInterface/Dialog/Lobby/LobbySocialWidgets.cpp
+        UserInterface/Dialog/Lobby/LobbySocialDialogs.cpp
         UserInterface/Dialog/Lobby/LobbyConnectDialog.cpp
         UserInterface/Dialog/Lobby/CreateRoomDialog.cpp
         UserInterface/Dialog/Lobby/RollbackLobbyDialog.cpp
+        UserInterface/Dialog/Lobby/RollbackLobbySocial.cpp
         UserInterface/Dialog/Netplay/NetplayCommon.cpp
         UserInterface/Dialog/Netplay/CreateNetplaySessionDialog.cpp
         UserInterface/Dialog/Netplay/CreateNetplaySessionDialog.ui
