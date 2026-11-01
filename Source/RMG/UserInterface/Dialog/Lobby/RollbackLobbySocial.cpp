@@ -126,7 +126,8 @@ namespace
 
     bool isNameChar(QChar ch)
     {
-        return ch.isLetterOrNumber() || ch == QLatin1Char('_') || ch == QLatin1Char('-') || ch == QLatin1Char('.');
+        return ch.isLetterOrNumber() || ch.isMark() || ch.isSurrogate() || ch == QChar(0x30FB) ||
+               ch == QLatin1Char('_') || ch == QLatin1Char('-') || ch == QLatin1Char('.');
     }
 } // namespace
 
@@ -1071,7 +1072,7 @@ QString RollbackLobbyDialog::chatBodyHtml(const QString& message, bool* mentions
             if (QStringView(message).mid(at + 1, length).compare(user.username, Qt::CaseInsensitive) != 0)
                 continue;
             const QChar next = at + 1 + length < message.size() ? message.at(at + 1 + length) : QChar();
-            if (next.isLetterOrNumber() || next == QLatin1Char('_'))
+            if (next.isLetterOrNumber() || next.isMark() || next.isSurrogate() || next == QLatin1Char('_'))
                 continue;
             best = &user;
         }

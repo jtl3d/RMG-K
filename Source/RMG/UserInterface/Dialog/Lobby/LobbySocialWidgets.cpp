@@ -291,7 +291,7 @@ void PlayerTile::paintEvent(QPaintEvent*)
     const bool darkInk = !t.dark ? false : (slot == 3 || slot == 4);
     painter.setPen(darkInk ? QColor(0, 0, 0, 200) : QColor(Qt::white));
     painter.setFont(LobbyTheme::pixelFont(int(width() * 0.46)));
-    painter.drawText(rect(), Qt::AlignCenter, m_name.left(1).toUpper());
+    painter.drawText(rect(), Qt::AlignCenter, LobbyTheme::nameInitial(m_name));
 }
 
 // ── ChatView ─────────────────────────────────────────────────────────

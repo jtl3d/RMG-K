@@ -1648,7 +1648,7 @@ void PortCard::showPlayer(const QString& name, bool isSelf, bool isHost, const Q
     m_youTag->setTag(StatusTag::Kind::Neutral, selfTag.isEmpty() ? tr("You") : selfTag);
     m_youTag->setVisible(isSelf);
     m_hostBadge->setVisible(isHost);
-    m_portrait->setInitial(name.isEmpty() ? QString() : name.left(1).toUpper());
+    m_portrait->setInitial(LobbyTheme::nameInitial(name));
 
     const QColor capInk = inkOnPort(m_slot);
     m_capLabel->setStyleSheet(QString("color: %1;").arg(capInk.name()));

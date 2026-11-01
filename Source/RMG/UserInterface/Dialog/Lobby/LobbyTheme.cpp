@@ -254,6 +254,13 @@ QFont pixelFont(int px, qreal letterSpacing)
     return font;
 }
 
+QString nameInitial(const QString& name)
+{
+    if (name.isEmpty())
+        return QString();
+    return name.left(name.front().isHighSurrogate() ? 2 : 1).toUpper();
+}
+
 QFont uiFont(int px, QFont::Weight weight)
 {
     QFont font = QApplication::font();

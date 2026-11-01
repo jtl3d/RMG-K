@@ -2267,6 +2267,10 @@ Use Default mode anyway?</source>
     </context>
     <context><name>UserInterface::Dialog::LobbyConnectDialog</name>
         <message>
+            <source>That name is too long. The limit is 15 Greek or Cyrillic characters, or 10 Japanese, Chinese or Korean characters.</source>
+            <translation>名前が長すぎます。上限はギリシャ文字・キリル文字で15文字、日本語・中国語・韓国語で10文字です。</translation>
+        </message>
+        <message>
             <source>Welcome to Netplay!</source>
             <translation>ネットプレイへようこそ！</translation>
         </message>
@@ -2687,8 +2691,12 @@ A local replay is saved only if Record locally is checked.</source>
             <translation>接続中…</translation>
         </message>
         <message>
-            <source>That username is already in use.</source>
-            <translation>そのユーザー名はすでに使用されています。</translation>
+            <source>That username is already in use, or looks too much like one that is.</source>
+            <translation>そのユーザー名はすでに使用されているか、使用中の名前と紛らわしすぎます。</translation>
+        </message>
+        <message>
+            <source>That name can&apos;t be used. Names are 2 to 20 letters, numbers, or _ - . in one alphabet, and at most 10 Japanese, Chinese or Korean characters.</source>
+            <translation>その名前は使用できません。名前は1種類の文字体系で2〜20文字の文字・数字または _ - . です（日本語・中国語・韓国語は10文字まで）。</translation>
         </message>
         <message>
             <source>Server rejected the connection handshake.</source>
@@ -3721,8 +3729,8 @@ A local replay is saved only if Save replay is on.</source>
             <translation>コントローラー%1（オフ）</translation>
         </message>
         <message>
-            <source>Names are 2 to 20 letters, numbers, or _ - . and can't be offensive.</source>
-            <translation>名前は2〜20文字の英数字または _ - . で、不快な内容は使えません。</translation>
+            <source>Names are 2 to 20 letters, numbers, or _ - . in one alphabet, at most 10 Japanese, Chinese or Korean characters, and can&apos;t be offensive.</source>
+            <translation>名前は1種類の文字体系で2〜20文字の文字・数字または _ - . です（日本語・中国語・韓国語は10文字まで）。不快な内容は使えません。</translation>
         </message>
         <message>
             <source>Someone in the lobby already has that name.</source>

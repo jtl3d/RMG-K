@@ -15,6 +15,7 @@
 class QLineEdit;
 class QPushButton;
 class QLabel;
+class QRegularExpression;
 
 namespace UserInterface
 {
@@ -42,6 +43,12 @@ public:
     // that bypass this dialog (e.g. the netplay launcher's rollback tab) can
     // connect with the same URL without duplicating the constant.
     static QString defaultServerUrl();
+
+    // The lobby decides what's a valid name. These keep typing to its characters,
+    // and catch what's too long for a replay's 32-byte field before it's refused.
+    static QRegularExpression usernameCharacters();
+    static bool usernameFits(const QString& username);
+    static QString fitUsername(QString username);
 
 private slots:
     void onConnect();

@@ -63,6 +63,8 @@ QString css(const QColor& color);
 // Silkscreen for labels and big numbers. It has no kana, so Japanese falls back
 // to the system UI font at the same size.
 QFont pixelFont(int px, qreal letterSpacing = 0.0);
+// The first character of a name, for avatars. Can be two code units.
+QString nameInitial(const QString& name);
 QFont uiFont(int px, QFont::Weight weight = QFont::Normal);
 
 // A tinted icon from the lobby's resources, sized for the given pixel ratio.

@@ -941,6 +941,10 @@ void LobbyClient::handleEnvelope(const QJsonObject& env)
 void LobbyClient::handleHelloOk(const QJsonObject& data)
 {
     m_selfUserId  = static_cast<quint64>(data.value("userId").toDouble());
+    // The lobby keeps one spelling of a name, which may not be the one typed.
+    const QString keptUsername = data.value("username").toString();
+    if (!keptUsername.isEmpty())
+        m_pendingUsername = keptUsername;
     m_observedIp  = data.value("observedIp").toString();
     m_region      = data.value("region").toString();
     m_localPlayersSupported = data.value("localPlayers").toBool();

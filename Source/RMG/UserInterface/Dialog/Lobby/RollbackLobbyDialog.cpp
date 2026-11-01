@@ -811,7 +811,7 @@ void RollbackLobbyDialog::updateUserChip()
         country = self->anonymous ? QString() : self->country;
     }
     m_userName->setText(name);
-    m_userAvatar->setInitial(name.left(1).toUpper());
+    m_userAvatar->setInitial(LobbyTheme::nameInitial(name));
     m_userFlag->setCountry(country);
     const bool moderator = m_client->isModerator();
     m_userFlag->setVisible(!moderator && !country.isEmpty());
@@ -2135,8 +2135,7 @@ QString RollbackLobbyDialog::prefillUsername() const
         name = QString::fromUtf8(envUser).trimmed();
     }
 
-    name.remove(QRegularExpression(R"([^A-Za-z0-9_\-\.])"));
-    return name.left(20);
+    return LobbyConnectDialog::fitUsername(name);
 }
 
 void RollbackLobbyDialog::promptForUsername(const QString& statusMessage)
@@ -2296,7 +2295,9 @@ void RollbackLobbyDialog::onClientStateChanged(LobbyClient::ConnectionState s)
 void RollbackLobbyDialog::onHelloFailed(const QString& reason)
 {
     QString human = reason;
-    if (reason == "username_taken")    human = tr("That username is already in use.");
+    if (reason == "username_taken")    human = tr("That username is already in use, or looks too much like one that is.");
+    else if (reason == "invalid_name") human = tr("That name can't be used. Names are 2 to 20 letters, numbers, or _ - . "
+                                                  "in one alphabet, and at most 10 Japanese, Chinese or Korean characters.");
     else if (reason == "invalid_hello") human = tr("Server rejected the connection handshake.");
     else if (reason == "invalid_payload") human = tr("That username isn't allowed.");
     else if (reason == "version_mismatch") human =
@@ -4958,8 +4959,7 @@ void RollbackLobbyDialog::buildLocalRoster()
     m_rosterName->setFont(LobbyTheme::uiFont(12));
     m_rosterName->setPlaceholderText(tr("Name"));
     m_rosterName->setMaxLength(20);
-    m_rosterName->setValidator(new QRegularExpressionValidator(
-        QRegularExpression(QStringLiteral(R"([A-Za-z0-9_\-\.]{1,20})")), m_rosterName));
+    m_rosterName->setValidator(new QRegularExpressionValidator(LobbyConnectDialog::usernameCharacters(), m_rosterName));
     m_rosterController = new QComboBox(m_rosterEditor);
     m_rosterController->setObjectName("LocalPlayerController");
     m_rosterController->setFont(LobbyTheme::uiFont(11));
@@ -5076,7 +5076,7 @@ void RollbackLobbyDialog::closeRosterEditor()
 void RollbackLobbyDialog::submitRosterEditor()
 {
     const QString name = m_rosterName->text().trimmed();
-    if (name.size() < 2)
+    if (name.size() < 2 || !LobbyConnectDialog::usernameFits(name))
     {
         onLocalPlayerFailed(name, QStringLiteral("invalid_name"));
         return;
@@ -5091,7 +5091,8 @@ void RollbackLobbyDialog::onLocalPlayerFailed(const QString& name, const QString
     m_rosterSubmittedName.clear();
     QString why;
     if (reason == QStringLiteral("invalid_name"))
-        why = tr("Names are 2 to 20 letters, numbers, or _ - . and can't be offensive.");
+        why = tr("Names are 2 to 20 letters, numbers, or _ - . in one alphabet, at most 10 Japanese, "
+                 "Chinese or Korean characters, and can't be offensive.");
     else if (reason == QStringLiteral("name_taken"))
         why = tr("Someone in the lobby already has that name.");
     else if (reason == QStringLiteral("too_many"))
@@ -5662,9 +5663,7 @@ void RollbackLobbyDialog::onMatchBegin(quint64 matchId, const QList<LobbyClient:
         {
             if (p.slot >= 1 && p.slot <= 4)
             {
-                const QByteArray nameBytes = p.username.toUtf8();
-                std::strncpy(recording_player_names[p.slot - 1], nameBytes.constData(), 31);
-                recording_player_names[p.slot - 1][31] = '\0';
+                n02::recordingSetPlayerName(p.slot - 1, p.username.toUtf8().constData());
             }
         }
     }
@@ -6037,9 +6036,7 @@ void RollbackLobbyDialog::launchAsLateJoiner()
     {
         if (peer.slot >= 1 && peer.slot <= 4 && !m_lateJoin.left.contains(peer.userId))
         {
-            const QByteArray nameBytes = peer.username.toUtf8();
-            std::strncpy(recording_player_names[peer.slot - 1], nameBytes.constData(), 31);
-            recording_player_names[peer.slot - 1][31] = '\0';
+            n02::recordingSetPlayerName(peer.slot - 1, peer.username.toUtf8().constData());
         }
         if (peer.peerId != selfId)
             remotePeers << QString("%1,ice,%2").arg(peer.slot).arg(peer.peerId);
@@ -6131,9 +6128,7 @@ void RollbackLobbyDialog::applyLateJoinRoster()
         const int slot = joiner.slot;
         if (slot >= 1 && slot <= 4)
         {
-            const QByteArray nameBytes = joiner.username.toUtf8();
-            std::strncpy(recording_player_names[slot - 1], nameBytes.constData(), 31);
-            recording_player_names[slot - 1][31] = '\0';
+            n02::recordingSetPlayerName(slot - 1, joiner.username.toUtf8().constData());
         }
     }
     emit portLabelsChanged();

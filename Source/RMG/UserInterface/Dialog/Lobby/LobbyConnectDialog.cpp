@@ -42,6 +42,29 @@ QString LobbyConnectDialog::defaultServerUrl()
     return QString::fromUtf8(kDefaultLobbyUrl);
 }
 
+QRegularExpression LobbyConnectDialog::usernameCharacters()
+{
+    return QRegularExpression(QStringLiteral(R"([\p{L}\p{Mn}0-9_\-\.\x{30FB}]{1,20})"));
+}
+
+bool LobbyConnectDialog::usernameFits(const QString& username)
+{
+    return username.toUtf8().size() <= 31;
+}
+
+QString LobbyConnectDialog::fitUsername(QString username)
+{
+    username = username.normalized(QString::NormalizationForm_C);
+    static const QRegularExpression notInName(QStringLiteral(R"([^\p{L}\p{Mn}0-9_\-\.\x{30FB}])"));
+    username.remove(notInName);
+    username.truncate(20);
+    if (!username.isEmpty() && username.back().isHighSurrogate())
+        username.chop(1);
+    while (!username.isEmpty() && !usernameFits(username))
+        username.chop(username.back().isLowSurrogate() ? 2 : 1);
+    return username;
+}
+
 LobbyConnectDialog::LobbyConnectDialog(QWidget* parent)
     : QDialog(parent)
 {
@@ -105,9 +128,7 @@ void LobbyConnectDialog::buildUi()
     m_usernameEdit->setMaxLength(20);
     m_usernameEdit->setMinimumHeight(38);
     m_usernameEdit->setPlaceholderText(tr("2-20 characters: letters, numbers, _ - ."));
-    auto* validator = new QRegularExpressionValidator(
-        QRegularExpression(R"([A-Za-z0-9_\-\.]{1,20})"), this);
-    m_usernameEdit->setValidator(validator);
+    m_usernameEdit->setValidator(new QRegularExpressionValidator(usernameCharacters(), this));
     body->addWidget(m_usernameEdit);
 
     m_validationLbl = new QLabel(this);
@@ -148,10 +169,20 @@ void LobbyConnectDialog::validateInput()
     QString reason;
     if (user.length() < 2)
         reason = tr("Username must be at least 2 characters.");
+    else if (!usernameFits(user))
+        reason = tr("That name is too long. The limit is 15 Greek or Cyrillic characters, "
+                    "or 10 Japanese, Chinese or Korean characters.");
 
     const QString message = reason.isEmpty() ? m_statusMessage : reason;
     m_validationLbl->setText(message);
     m_connectButton->setEnabled(reason.isEmpty());
+    // The message can wrap, which the dialog has to grow for. The label only marks
+    // the top layout dirty, so its own stays stale without the activate.
+    if (isVisible())
+    {
+        layout()->activate();
+        adjustSize();
+    }
 }
 
 void LobbyConnectDialog::onConnect()
