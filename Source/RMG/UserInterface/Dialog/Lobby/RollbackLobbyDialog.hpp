@@ -100,8 +100,9 @@ public:
     // typed messages reach the room while a match is running.
     void sendRoomChat(const QString& message);
 
-    // Sends a chat line to the other viewers of the live replay being watched.
-    // The match's players never receive it. No-op unless spectating.
+    // Sends a chat line to a live replay's chat: its viewers and, on a server that
+    // shares it, the match's players. No-op unless watching, or playing a match
+    // being broadcast.
     void sendSpectatorChat(const QString& message);
 
     // MainWindow calls this when a spectate playback session ends (emulation
@@ -306,7 +307,7 @@ private:
     void connectSocialSignals();
     void resetSocialState();
     bool socialEventFilter(QObject* watched, QEvent* event);
-    void refreshMailTabIcon();
+    void refreshChatTabIcons();
     // Anything that plays a sound or flashes the taskbar goes through this, so
     // Do not disturb and the per-sender limit apply to all of it.
     void alertFrom(quint64 userId);
@@ -364,7 +365,7 @@ private:
     // One line of chat. bodyHtml is from chatBodyHtml. mine marks this PC's own
     // lines in a private conversation.
     QString chatMessageHtml(const QString& time, quint64 userId, const QString& who, const QString& bodyHtml,
-                            bool fromAdmin, bool mine = false) const;
+                            bool fromAdmin, bool mine = false, bool fromPlayer = false) const;
     void    refreshChatInput();
     void    setChatUnread(int tab, int count);
     void    setRoomChatVisible(bool visible);
@@ -421,6 +422,10 @@ private:
     // Shows the Spectators chat tab (and selects it) while watching a live
     // replay; hiding it returns the column to lobby chat.
     void setSpectatorChatVisible(bool visible);
+    // Opens and closes the spectators' chat for this client as a player.
+    void refreshPlayerSpectatorChat();
+    void refreshSpectatorTab();
+    void showSpectatorCommentOverGame(const LobbyClient::ChatMessage& msg);
 
     // Seat API — 4 fixed slots rendered as port cards. Only cards 1..maxPlayers
     // are visible (others hidden via setVisible).
@@ -533,7 +538,12 @@ private:
     QTimer*      m_matchDurationTimer = nullptr;
     ChatView*    m_chatViewLobby = nullptr;
     ChatView*    m_chatViewRoom  = nullptr; // room chat, the Room tab
-    ChatView*    m_chatViewSpectate = nullptr; // spectators' chat while watching
+    ChatView*    m_chatViewSpectate = nullptr; // spectators' chat, watching or playing
+    // Above that chat for a player: how many are watching, and the overlay switch.
+    QWidget*     m_spectatorStrip = nullptr;
+    IconLabel*   m_spectatorEye   = nullptr;
+    QLabel*      m_spectatorCount = nullptr;
+    ToggleSwitch* m_spectatorOverlayToggle = nullptr;
     QTabBar*     m_chatTabs      = nullptr; // Lobby | Room | Spectators | mail
     QStackedWidget* m_chatStack  = nullptr; // one view per tab
     QLineEdit*   m_chatInput     = nullptr; // sends to the selected tab
@@ -642,6 +652,12 @@ private:
     // Non-zero while this client is spectating a broadcast match (the match id
     // we asked the server to stream). Cleared when the spectate session ends.
     quint64    m_spectatingMatchId = 0;
+    // The match whose spectators this client, as a player, last chatted with. It
+    // stays set after that chat closes, so the lines stay readable until the next
+    // match or leaving the room. Live means it can still be posted to.
+    quint64    m_playerChatMatchId = 0;
+    bool       m_playerChatLive = false;
+    QString    m_roomSubText; // the room's subtitle, without its audience
     // Session boundary guard. The persistent lobby socket can still deliver krec
     // chunks from a PREVIOUS watch of the same match after we re-subscribe (same
     // matchId, so they'd otherwise pass the filter and corrupt the new replay).

@@ -125,6 +125,8 @@ public:
         // Sender was a server-authenticated moderator when this was sent.
         // Old servers never send the field, so it stays false.
         bool fromAdmin = false;
+        // Spectator chat only: the sender is playing the match being watched.
+        bool fromPlayer = false;
         // Private messages only: who it's for, this client or one of its local
         // players when it was sent to this PC.
         quint64 toUserId = 0;
@@ -195,6 +197,9 @@ public:
 
     // Private messages and challenges work on this server.
     bool socialSupported() const { return m_socialSupported; }
+
+    // A match's players share its spectators' chat on this server.
+    bool spectatorChatSupported() const { return m_spectatorChatSupported; }
 
     // Challenges. From inside a room the server makes this an invite to it and
     // ignores the ROM.
@@ -565,6 +570,7 @@ private:
     int m_matchSeats = 0;
 
     bool m_socialSupported = false;
+    bool m_spectatorChatSupported = false;
     bool m_localPlayersSupported = false;
     QList<LocalPlayer> m_localPlayers;
     QHash<QString, int> m_pendingLocalControllers; // asked for, by name, until the server answers

@@ -561,6 +561,7 @@ void LobbyClient::connectToServer(const QString& wsUrl, const QString& username,
     m_pendingLocalControllers.clear();
     m_localPlayersSupported = false;
     m_socialSupported = false;
+    m_spectatorChatSupported = false;
     emit localPlayersChanged();
 
     qInfo() << "Rollback lobby local IPv4 detection"
@@ -810,6 +811,7 @@ void LobbyClient::onWsConnected()
     data["lateJoin"] = true;
     data["localPlayers"] = true;
     data["social"] = true;
+    data["spectatorChat"] = true;
     if (!m_pendingLocalIp.isEmpty())
         data["localIp"] = m_pendingLocalIp;
 
@@ -943,6 +945,7 @@ void LobbyClient::handleHelloOk(const QJsonObject& data)
     m_region      = data.value("region").toString();
     m_localPlayersSupported = data.value("localPlayers").toBool();
     m_socialSupported = data.value("social").toBool();
+    m_spectatorChatSupported = data.value("spectatorChat").toBool();
     emit localPlayersChanged();
 
     std::string stunHost = "stun.l.google.com";
@@ -1711,6 +1714,7 @@ void LobbyClient::handleChatMsg(const QJsonObject& data)
     m.message        = data.value("message").toString();
     m.serverTimeMs   = static_cast<qint64>(data.value("serverTime").toDouble());
     m.fromAdmin      = data.value("admin").toBool();
+    m.fromPlayer     = data.value("fromPlayer").toBool();
     m.toUserId       = static_cast<quint64>(data.value("toUserId").toDouble());
     m.toUsername     = data.value("toUsername").toString();
     emit chatMessageReceived(m);

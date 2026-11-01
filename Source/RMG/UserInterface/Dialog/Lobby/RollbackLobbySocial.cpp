@@ -61,7 +61,10 @@ namespace
 
     const char* const kIgnoredSetting = "Lobby/IgnoredPlayers";
     const char* const kDoNotDisturbSetting = "Lobby/DoNotDisturb";
+    const char* const kSpectatorOverlaySetting = "Lobby/SpectatorChatOverGame";
 
+    // The most of one spectator's comment that goes over the game.
+    constexpr int kOverlayCommentChars = 120;
     // How often one person can make this PC make a noise.
     constexpr qint64 kAlertIntervalMs = 30'000;
     // How long the play bar shows how a challenge ended, if nobody clicks OK.
@@ -162,6 +165,10 @@ void RollbackLobbyDialog::connectSocialSignals()
     QSettings settings("RMG-K", "n02");
     m_ignored = settings.value(kIgnoredSetting).toStringList();
     m_doNotDisturb = settings.value(kDoNotDisturbSetting, false).toBool();
+    m_spectatorOverlayToggle->setChecked(settings.value(kSpectatorOverlaySetting, false).toBool());
+    connect(m_spectatorOverlayToggle, &QCheckBox::toggled, this, [](bool checked) {
+        QSettings("RMG-K", "n02").setValue(kSpectatorOverlaySetting, checked);
+    });
 }
 
 void RollbackLobbyDialog::connectChatView(ChatView* view)
@@ -228,12 +235,13 @@ bool RollbackLobbyDialog::socialEventFilter(QObject* watched, QEvent* event)
     return false;
 }
 
-void RollbackLobbyDialog::refreshMailTabIcon()
+void RollbackLobbyDialog::refreshChatTabIcons()
 {
     if (m_chatTabs)
     {
         m_chatTabs->setTabIcon(kChatTabMail, QIcon(LobbyTheme::icon(QStringLiteral("mail-line"),
             LobbyTheme::tokens().ink2, 14, devicePixelRatioF())));
+        refreshSpectatorTab();
     }
 }
 
@@ -937,6 +945,91 @@ void RollbackLobbyDialog::refreshPrivateMessageStatus(quint64 userId)
 }
 
 // ──────────────────────────────────────────────────────────────────────
+//  Spectator chat, as a player
+// ──────────────────────────────────────────────────────────────────────
+
+void RollbackLobbyDialog::refreshPlayerSpectatorChat()
+{
+    if (!m_chatTabs || !m_client)
+        return;
+
+    if (m_currentRoomId == 0)
+    {
+        if (m_playerChatMatchId != 0)
+        {
+            m_playerChatMatchId = 0;
+            m_playerChatLive = false;
+            m_spectatorStrip->setVisible(false);
+            m_chatViewSpectate->clear();
+            setSpectatorChatVisible(false);
+        }
+        return;
+    }
+    const auto room = m_client->rooms().constFind(m_currentRoomId);
+    if (room == m_client->rooms().constEnd())
+        return; // this room's first listing hasn't arrived yet
+
+    const bool live = m_client->spectatorChatSupported() && m_currentMatchId != 0 &&
+                      room->broadcasting && room->matchId == m_currentMatchId;
+    if (live && m_playerChatMatchId != m_currentMatchId)
+    {
+        m_playerChatMatchId = m_currentMatchId;
+        m_chatViewSpectate->clear();
+        m_pendingMentions[kChatTabSpectators].clear();
+        m_chatTabs->setTabVisible(kChatTabSpectators, true);
+        refreshSpectatorTab();
+        appendChatSystemLine(CHANNEL_SPECTATE, tr("Spectators' comments show up here, and they can see your replies."),
+                             QStringLiteral("eye-line"));
+        setChatUnread(kChatTabSpectators, 0);
+    }
+    else if (!live && m_playerChatLive)
+    {
+        const int unread = m_chatUnread[kChatTabSpectators];
+        appendChatSystemLine(CHANNEL_SPECTATE, tr("Spectator chat is closed until your next match."), QStringLiteral("eye-line"));
+        setChatUnread(kChatTabSpectators, unread);
+    }
+    const bool changed = live != m_playerChatLive;
+    m_playerChatLive = live;
+    m_spectatorStrip->setVisible(m_playerChatMatchId != 0);
+    const QString audience = tr("%1 watching").arg(room->viewerCount);
+    m_spectatorCount->setText(audience);
+    m_roomSubLabel->setText(live && room->viewerCount > 0 ? m_roomSubText + QStringLiteral(" · ") + audience : m_roomSubText);
+    if (changed)
+    {
+        refreshSpectatorTab();
+        refreshChatInput();
+    }
+}
+
+void RollbackLobbyDialog::refreshSpectatorTab()
+{
+    // Beside Room there's no space for the word.
+    const bool icon = m_currentRoomId != 0;
+    m_chatTabs->setTabText(kChatTabSpectators, icon ? QString() : tr("Spectators").toUpper());
+    m_chatTabs->setTabIcon(kChatTabSpectators, icon
+        ? QIcon(LobbyTheme::icon(QStringLiteral("eye-line"), LobbyTheme::tokens().ink2, 14, devicePixelRatioF()))
+        : QIcon());
+    m_spectatorEye->setColorOverride(LobbyTheme::tokens().stateWatch);
+
+    const bool shared = m_client && m_client->spectatorChatSupported();
+    m_chatTabs->setTabToolTip(kChatTabSpectators, m_playerChatMatchId != 0
+        ? tr("Everyone watching your match. They can see your replies.")
+        : shared ? tr("Everyone watching this match, and its players.")
+                 : tr("Everyone watching this match. The players can't see it."));
+}
+
+void RollbackLobbyDialog::showSpectatorCommentOverGame(const LobbyClient::ChatMessage& msg)
+{
+    if (!m_spectatorOverlayToggle->isChecked() || m_client->isOnThisPc(msg.fromUserId))
+        return;
+    QString text = msg.message.simplified();
+    if (text.size() > kOverlayCommentChars)
+        text = text.left(kOverlayCommentChars) + QStringLiteral("…");
+    // Not roomChatReceived: that also writes the line into a saved replay.
+    emit overlayMessage((msg.fromPlayer ? tr("%1: %2") : tr("%1 (watching): %2")).arg(msg.fromUsername, text));
+}
+
+// ──────────────────────────────────────────────────────────────────────
 //  Mentions
 // ──────────────────────────────────────────────────────────────────────
 
@@ -1032,10 +1125,14 @@ void RollbackLobbyDialog::noteMention(const QString& channel, const LobbyClient:
         m_pendingMentions[tab].append(view->document()->lastBlock().blockNumber());
         refreshMentionJump();
     }
+    // Someone playing isn't interrupted: the badge waits for them, and their switch
+    // says whether comments reach the game.
+    if (tab == kChatTabSpectators && m_spectatingMatchId == 0)
+        return;
     alertFrom(msg.fromUserId);
-    // Room chat already reaches the in-game overlay. Not roomChatReceived for the
-    // others: that also writes the line into a saved replay.
-    if (channel != QLatin1String(CHANNEL_ROOM))
+    // Room and spectator chat already reach the in-game overlay. Not roomChatReceived
+    // for the lobby: that also writes the line into a saved replay.
+    if (channel == QLatin1String(CHANNEL_LOBBY))
         emit overlayMessage(tr("%1: %2").arg(msg.fromUsername, msg.message));
 }
 

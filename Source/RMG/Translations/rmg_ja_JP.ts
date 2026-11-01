@@ -4192,6 +4192,54 @@ A local replay is saved only if Save replay is on.</source>
             <source>✓ Moderator access granted (%1). Right-click a player to moderate, or type /modhelp.</source>
             <translation>✓ モデレーター権限を取得しました（%1）。プレイヤーを右クリックして操作するか、/modhelp と入力してください。</translation>
         </message>
+        <message>
+            <source>Over the game</source>
+            <translation>ゲーム画面に表示</translation>
+        </message>
+        <message>
+            <source>Show spectators' comments over the game while you play.</source>
+            <translation>プレイ中、観戦者のコメントをゲーム画面に表示します。</translation>
+        </message>
+        <message>
+            <source>Message the spectators…</source>
+            <translation>観戦者にメッセージ…</translation>
+        </message>
+        <message>
+            <source>Closed until your next match</source>
+            <translation>次の対戦まで利用できません</translation>
+        </message>
+        <message>
+            <source>Message the spectators and players…</source>
+            <translation>観戦者とプレイヤーにメッセージ…</translation>
+        </message>
+        <message>
+            <source>The players can read this chat too.</source>
+            <translation>プレイヤーもこのチャットを読めます。</translation>
+        </message>
+        <message>
+            <source>Spectators' comments show up here, and they can see your replies.</source>
+            <translation>観戦者のコメントがここに表示されます。あなたの返信も観戦者に見えます。</translation>
+        </message>
+        <message>
+            <source>Spectator chat is closed until your next match.</source>
+            <translation>観戦者チャットは次の対戦まで閉じています。</translation>
+        </message>
+        <message>
+            <source>%1 watching</source>
+            <translation>%1人が観戦中</translation>
+        </message>
+        <message>
+            <source>Everyone watching your match. They can see your replies.</source>
+            <translation>あなたの対戦を観戦している人たちです。返信は観戦者に見えます。</translation>
+        </message>
+        <message>
+            <source>Everyone watching this match, and its players.</source>
+            <translation>この対戦の観戦者とプレイヤーです。</translation>
+        </message>
+        <message>
+            <source>%1 (watching): %2</source>
+            <translation>%1（観戦中）: %2</translation>
+        </message>
     </context>
     <context>
         <name>UserInterface::Dialog::CreateRoomDialog</name>
