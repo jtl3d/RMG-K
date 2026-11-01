@@ -1637,7 +1637,7 @@ void PortCard::showOpen(const QString& hint)
     update();
 }
 
-void PortCard::showPlayer(const QString& name, bool isSelf, bool isHost)
+void PortCard::showPlayer(const QString& name, bool isSelf, bool isHost, const QString& selfTag)
 {
     m_open = false;
     m_self = isSelf;
@@ -1645,6 +1645,7 @@ void PortCard::showPlayer(const QString& name, bool isSelf, bool isHost)
     m_openPage->setVisible(false);
     m_playerPage->setVisible(true);
     m_name->setText(name);
+    m_youTag->setTag(StatusTag::Kind::Neutral, selfTag.isEmpty() ? tr("You") : selfTag);
     m_youTag->setVisible(isSelf);
     m_hostBadge->setVisible(isHost);
     m_portrait->setInitial(name.isEmpty() ? QString() : name.left(1).toUpper());

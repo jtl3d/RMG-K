@@ -3680,6 +3680,102 @@ A local replay is saved only if Save replay is on.</source>
             <source>Set by the host (%1)</source>
             <translation>ホストが設定（%1）</translation>
         </message>
+        <message>
+            <source>This PC</source>
+            <translation>このPC</translation>
+        </message>
+        <message>
+            <source>That room doesn't have a free seat for everyone on this PC.</source>
+            <translation>このPCの全員が座れる空席がそのルームにはありません。</translation>
+        </message>
+        <message>
+            <source>That room needs a newer version of RMG-K.</source>
+            <translation>そのルームには新しいバージョンのRMG-Kが必要です。</translation>
+        </message>
+        <message>
+            <source>Someone in that room is on an older RMG-K that can't play with several players on one PC. Remove the other players on this PC to join.</source>
+            <translation>そのルームに、1台のPCで複数人がプレイすることに対応していない古いRMG-Kの参加者がいます。参加するには、このPCの他のプレイヤーを外してください。</translation>
+        </message>
+        <message>
+            <source>Quick Match pairs two players, one on each PC. Remove the other players on this PC, or create a room to play together.</source>
+            <translation>クイックマッチは各PCから1人ずつ、2人をマッチさせます。このPCの他のプレイヤーを外すか、ルームを作成して一緒にプレイしてください。</translation>
+        </message>
+        <message>
+            <source>The controller they play on. Set controllers up in Input settings.</source>
+            <translation>このプレイヤーが使うコントローラーです。コントローラーは入力設定で設定できます。</translation>
+        </message>
+        <message>
+            <source>Add</source>
+            <translation>追加</translation>
+        </message>
+        <message>
+            <source>Add a player on this PC</source>
+            <translation>このPCにプレイヤーを追加</translation>
+        </message>
+        <message>
+            <source>Controller %1</source>
+            <translation>コントローラー%1</translation>
+        </message>
+        <message>
+            <source>Controller %1 (off)</source>
+            <translation>コントローラー%1（オフ）</translation>
+        </message>
+        <message>
+            <source>Names are 2 to 20 letters, numbers, or _ - . and can't be offensive.</source>
+            <translation>名前は2〜20文字の英数字または _ - . で、不快な内容は使えません。</translation>
+        </message>
+        <message>
+            <source>Someone in the lobby already has that name.</source>
+            <translation>その名前はロビーの他のプレイヤーが使用中です。</translation>
+        </message>
+        <message>
+            <source>One PC can have up to %1 players.</source>
+            <translation>1台のPCでプレイできるのは%1人までです。</translation>
+        </message>
+        <message>
+            <source>Leave the room to change who's playing on this PC.</source>
+            <translation>このPCのプレイヤーを変更するには、ルームを退出してください。</translation>
+        </message>
+        <message>
+            <source>Stop searching to change who's playing on this PC.</source>
+            <translation>このPCのプレイヤーを変更するには、検索を停止してください。</translation>
+        </message>
+        <message>
+            <source>That's a lot of changes at once. Try again in a moment.</source>
+            <translation>一度に変更が多すぎます。少し待ってからもう一度お試しください。</translation>
+        </message>
+        <message>
+            <source>The lobby refused that (%1).</source>
+            <translation>ロビーに拒否されました（%1）。</translation>
+        </message>
+        <message>
+            <source>The controller %1 plays on.</source>
+            <translation>%1が使うコントローラーです。</translation>
+        </message>
+        <message>
+            <source>This controller is off. Turn it on in Input settings before playing.</source>
+            <translation>このコントローラーはオフです。プレイする前に入力設定でオンにしてください。</translation>
+        </message>
+        <message>
+            <source>Remove %1 from this PC</source>
+            <translation>%1をこのPCから外す</translation>
+        </message>
+        <message>
+            <source>Play with someone else on this PC. They join every room with you, on their own controller.</source>
+            <translation>このPCで他の人と一緒にプレイします。その人は自分のコントローラーで、あなたと一緒にすべてのルームに参加します。</translation>
+        </message>
+        <message>
+            <source>%1 can't play yet: controller %2 is off. Turn it on in Input settings.</source>
+            <translation>%1はまだプレイできません。コントローラー%2がオフです。入力設定でオンにしてください。</translation>
+        </message>
+        <message>
+            <source>%1 and %2</source>
+            <translation>%1と%2</translation>
+        </message>
+        <message>
+            <source>%1 are joining the game</source>
+            <translation>%1がゲームに参加します</translation>
+        </message>
     </context>
     <context>
         <name>UserInterface::Dialog::CreateRoomDialog</name>
@@ -3718,6 +3814,14 @@ A local replay is saved only if Save replay is on.</source>
         <message>
             <source>Cancel</source>
             <translation>キャンセル</translation>
+        </message>
+        <message>
+            <source>You have %1 players on this PC.</source>
+            <translation>このPCには%1人のプレイヤーがいます。</translation>
+        </message>
+        <message>
+            <source>It needs a seat for everyone on this PC.</source>
+            <translation>このPCの全員分の席が必要です。</translation>
         </message>
     </context>
     <context>
@@ -3987,6 +4091,18 @@ A local replay is saved only if Save replay is on.</source>
         <message>
             <source>Match in progress. Join, and the host can add you to the game.</source>
             <translation>対戦中です。参加すると、ホストがゲームに追加できます。</translation>
+        </message>
+        <message>
+            <source>Needs %1 seats</source>
+            <translation>%1席必要</translation>
+        </message>
+        <message>
+            <source>You have %1 players on this PC, and this room has 1 free seat.</source>
+            <translation>このPCには%1人のプレイヤーがいますが、このルームの空席は1席です。</translation>
+        </message>
+        <message>
+            <source>You have %1 players on this PC, and this room has %2 free seats.</source>
+            <translation>このPCには%1人のプレイヤーがいますが、このルームの空席は%2席です。</translation>
         </message>
     </context>
     <context>

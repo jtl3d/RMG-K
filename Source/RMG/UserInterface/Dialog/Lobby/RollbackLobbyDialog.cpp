@@ -45,6 +45,9 @@
 #include "n02_client.h" // setRecordingStreamSink (broadcast tee)
 
 #include <QRegularExpression>
+#include <QRegularExpressionValidator>
+#include <QKeyEvent>
+#include <QSignalBlocker>
 
 #include <QApplication>
 #include <QCoreApplication>
@@ -500,6 +503,9 @@ RollbackLobbyDialog::RollbackLobbyDialog(QWidget* parent)
     connect(m_client, &LobbyClient::roomLeft,             this, &RollbackLobbyDialog::onRoomLeft);
     connect(m_client, &LobbyClient::roomStateChanged,     this, &RollbackLobbyDialog::onRoomStateChanged);
     connect(m_client, &LobbyClient::quickMatchStatus,     this, &RollbackLobbyDialog::onQuickMatchStatusChanged);
+    connect(m_client, &LobbyClient::quickMatchRefused,    this, &RollbackLobbyDialog::onQuickMatchRefused);
+    connect(m_client, &LobbyClient::localPlayersChanged,  this, &RollbackLobbyDialog::refreshLocalRoster);
+    connect(m_client, &LobbyClient::localPlayerFailed,    this, &RollbackLobbyDialog::onLocalPlayerFailed);
     connect(m_client, &LobbyClient::chatMessageReceived,  this, &RollbackLobbyDialog::onChatMessageReceived);
     connect(m_client, &LobbyClient::adminAuthResult,      this, &RollbackLobbyDialog::onAdminAuthResult);
     connect(m_client, &LobbyClient::modNotice,            this, &RollbackLobbyDialog::onModNotice);
@@ -1270,6 +1276,7 @@ void RollbackLobbyDialog::renderSeatEmpty(SeatRow& s)
     s.isSelf = false;
     s.canKick = false;
     s.userId = 0;
+    s.peerId = 0;
     s.username.clear();
     s.frameDelay = -1;
     s.iceAttempt = 1;
@@ -1291,7 +1298,8 @@ void RollbackLobbyDialog::renderSeatFilled(SeatRow& s, const QString& username, 
     s.username = username;
     s.frameDelay = frameDelay;
 
-    s.row->showPlayer(username, isSelf, isHost);
+    s.row->showPlayer(username, isSelf, isHost,
+                      m_client && m_client->isLocalPlayer(s.userId) ? tr("This PC") : QString());
     s.row->setConnection(connectionType);
     s.row->setDelay(frameDelay);
     // Self is a local zero-latency endpoint. Remote ping appears after the
@@ -1521,23 +1529,33 @@ QWidget* RollbackLobbyDialog::buildPlayersColumn()
             m_playersSearch->clear();
     });
 
-    m_playersTree = new QTreeWidget(card);
-    m_playersTree->setObjectName("PlayersTree");
-    m_playersTree->setColumnCount(1);
-    m_playersTree->setHeaderHidden(true);
-    m_playersTree->setRootIsDecorated(false);
-    m_playersTree->setIndentation(0);
-    m_playersTree->setItemsExpandable(false);
-    m_playersTree->setFrameShape(QFrame::NoFrame);
-    m_playersTree->setFocusPolicy(Qt::NoFocus);
-    m_playersTree->setMouseTracking(true);
-    m_playersTree->setUniformRowHeights(false);
-    m_playersTree->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    m_playersTree->viewport()->setAutoFillBackground(false);
-    m_playersTree->setItemDelegate(new PlayersItemDelegate(m_playersTree));
+    const auto makePlayersList = [card]() {
+        auto* list = new QTreeWidget(card);
+        list->setObjectName("PlayersTree");
+        list->setColumnCount(1);
+        list->setHeaderHidden(true);
+        list->setRootIsDecorated(false);
+        list->setIndentation(0);
+        list->setItemsExpandable(false);
+        list->setFrameShape(QFrame::NoFrame);
+        list->setFocusPolicy(Qt::NoFocus);
+        list->setMouseTracking(true);
+        list->setUniformRowHeights(false);
+        list->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        list->viewport()->setAutoFillBackground(false);
+        list->setItemDelegate(new PlayersItemDelegate(list));
+        return list;
+    };
+    m_playersTree = makePlayersList();
+
+    // Your own row stays in view above the list, with this PC's other players.
+    m_selfRow = makePlayersList();
+    m_selfRow->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    m_selfRow->setFixedHeight(24);
+    m_selfRow->setVisible(false);
 
     // One heading per state, in the order people look for them. Each hides
-    // itself while empty; the local player's row sits above them all.
+    // itself while empty.
     const QStringList titles = { tr("Searching"), tr("Playing"), tr("Watching"), tr("In rooms"), tr("Online") };
     for (const QString& title : titles)
     {
@@ -1560,9 +1578,14 @@ QWidget* RollbackLobbyDialog::buildPlayersColumn()
     // eventFilter — there's no built-in property for it).
     m_playersTree->viewport()->installEventFilter(this);
 
+    buildLocalRoster();
+
     auto* treeWrap = new QVBoxLayout;
     treeWrap->setContentsMargins(5, 0, 5, 5);
-    treeWrap->addWidget(m_playersTree);
+    treeWrap->setSpacing(0);
+    treeWrap->addWidget(m_selfRow);
+    treeWrap->addWidget(m_rosterBox);
+    treeWrap->addWidget(m_playersTree, 1);
     cardLay->addLayout(treeWrap, 1);
 
     return card;
@@ -1758,6 +1781,23 @@ void RollbackLobbyDialog::closeEvent(QCloseEvent* event)
 
 bool RollbackLobbyDialog::eventFilter(QObject* watched, QEvent* event)
 {
+    // Enter and Escape in the roster's name box stop here: the dialog would press
+    // its default button for one and close the lobby for the other.
+    if (m_rosterName && watched == m_rosterName && event->type() == QEvent::KeyPress)
+    {
+        const int key = static_cast<QKeyEvent*>(event)->key();
+        if (key == Qt::Key_Return || key == Qt::Key_Enter)
+        {
+            submitRosterEditor();
+            return true;
+        }
+        if (key == Qt::Key_Escape)
+        {
+            closeRosterEditor();
+            return true;
+        }
+    }
+
     if (m_playersTree && watched == m_playersTree->viewport())
     {
         // A click in the players-list viewport that doesn't land on a row clears
@@ -1990,6 +2030,7 @@ void RollbackLobbyDialog::onClientStateChanged(LobbyClient::ConnectionState s)
             m_pingProbeTimer->stop();
     }
     refreshChatInput();
+    refreshLocalRoster();
     if (m_quickMatchBtn)
         m_quickMatchBtn->setEnabled(connected && m_currentRoomId == 0);
     if (m_createRoomBtn)
@@ -2368,6 +2409,8 @@ void RollbackLobbyDialog::clearPlayerRows()
 {
     qDeleteAll(m_userItems);
     m_userItems.clear();
+    if (m_selfRow)
+        m_selfRow->setVisible(false);
     refreshPlayerGroups();
 }
 
@@ -2387,16 +2430,29 @@ QTreeWidgetItem* RollbackLobbyDialog::playerGroupForState(const QString& state) 
 
 void RollbackLobbyDialog::placePlayerRow(QTreeWidgetItem* item, const LobbyClient::LobbyUser& u)
 {
-    // The local player stays on top, above the headings.
+    // This PC's other players are listed in the roster instead.
+    if (m_client->isLocalPlayer(u.id))
+    {
+        if (QTreeWidgetItem* parent = item->parent())
+            parent->removeChild(item);
+        else if (m_playersTree->indexOfTopLevelItem(item) >= 0)
+            return;
+        m_playersTree->addTopLevelItem(item);
+        item->setHidden(true);
+        return;
+    }
+
+    // This client's own row has its own place above the list.
     if (u.id == m_client->selfUserId())
     {
-        if (m_playersTree->indexOfTopLevelItem(item) == 0)
+        if (m_selfRow->indexOfTopLevelItem(item) >= 0)
             return;
         if (QTreeWidgetItem* parent = item->parent())
             parent->removeChild(item);
         else if (const int index = m_playersTree->indexOfTopLevelItem(item); index >= 0)
             m_playersTree->takeTopLevelItem(index);
-        m_playersTree->insertTopLevelItem(0, item);
+        m_selfRow->addTopLevelItem(item);
+        m_selfRow->setVisible(true);
         return;
     }
 
@@ -2578,6 +2634,7 @@ void RollbackLobbyDialog::onRoomListChanged()
             match.startedAtMs = r.startedAtMs;
             match.viewers = r.viewerCount;
             match.openSeats = r.lateJoin ? std::max(0, r.maxPlayers - r.players) : 0;
+            match.seatsNeeded = m_client->seatsOnThisPc();
             match.hasRom = hasRom;
             match.sameGame = sameGame;
             match.watching = m_spectatingMatchId != 0 && m_spectatingMatchId == r.matchId;
@@ -2601,6 +2658,7 @@ void RollbackLobbyDialog::onRoomListChanged()
         room.hasPassword = r.hasPassword;
         room.inGame = r.state == "in_game";
         room.mine = r.id == m_currentRoomId;
+        room.seatsNeeded = m_client->seatsOnThisPc();
         room.hasRom = hasRom;
         room.sameGame = sameGame;
         room.hostCountry = countries.value(r.hostName);
@@ -2748,6 +2806,7 @@ void RollbackLobbyDialog::onCreateRoomClicked()
     m_createRoomDialog = new CreateRoomDialog(
         m_username, m_lastRoomName, romName, romMd5, this);
     m_createRoomDialog->setCoverPath(coverPathForMd5(romMd5));
+    m_createRoomDialog->setMinimumPlayers(m_client->seatsOnThisPc());
     connect(m_createRoomDialog, &CreateRoomDialog::createRequested,
             this, &RollbackLobbyDialog::onRoomCreateRequested);
     connect(m_createRoomDialog, &QDialog::finished, this, [this](int) {
@@ -2810,6 +2869,13 @@ void RollbackLobbyDialog::onRoomJoinFailed(const QString& reason)
         tr("You were removed from this room and cannot rejoin.");
     else if (reason == "kicked_recently") human =
         tr("You were recently removed from this room. Try again in a moment.");
+    else if (reason == "not_enough_seats") human =
+        tr("That room doesn't have a free seat for everyone on this PC.");
+    else if (reason == "needs_update") human =
+        tr("That room needs a newer version of RMG-K.");
+    else if (reason == "peer_needs_update") human =
+        tr("Someone in that room is on an older RMG-K that can't play with several players on one PC. "
+           "Remove the other players on this PC to join.");
     QMessageBox::warning(this, tr("Couldn't join room"), human);
 }
 
@@ -2876,6 +2942,8 @@ void RollbackLobbyDialog::enterRoom(quint64 roomId, const QString& greetingChatL
 
     if (!greetingChatLine.isEmpty())
         appendChatLine(CHANNEL_ROOM, greetingChatLine);
+
+    refreshLocalRoster();
 
     // Backstop in case ROOM_STATE seats arrive in a shape that didn't trigger a
     // per-peer probe — kick one sweep shortly after entry so every client starts
@@ -2965,6 +3033,11 @@ void RollbackLobbyDialog::onMatchWatchRequested(quint64 roomId)
 
 void RollbackLobbyDialog::onRoomCreateFailed(const QString& reason)
 {
+    if (m_createRoomDialog)
+    {
+        m_createRoomDialog->showCreateFailure(reason);
+        return;
+    }
     QMessageBox::warning(this, tr("Couldn't create room"), reason);
 }
 
@@ -3117,9 +3190,11 @@ void RollbackLobbyDialog::onRoomStateChanged(const QJsonObject& roomState)
         if (slot < 1 || slot > 4) continue;
         const QString user = p.value("username").toString();
         const quint64 uid = static_cast<quint64>(p.value("userId").toDouble());
+        const quint64 peerId = LobbyClient::seatPeerId(p);
         const bool slotIsHost = (uid == hostId);
-        const bool slotIsSelf = (uid == m_client->selfUserId());
-        const int pingMs = slotIsSelf ? 0 : m_client->measuredPingMs(uid);
+        // Every seat on this PC: no connection to measure, and the same delay.
+        const bool slotIsSelf = (peerId == m_client->selfUserId());
+        const int pingMs = slotIsSelf ? 0 : m_client->measuredPingMs(peerId);
         const int frameDelay = slotIsSelf
             ? m_currentRoomDelay
             : p.value("frameDelay").toInt(-1);
@@ -3133,14 +3208,15 @@ void RollbackLobbyDialog::onRoomStateChanged(const QJsonObject& roomState)
             country = userIt->country;
             anonymous = userIt->anonymous;
         }
-        // The host can remove any seated player except themselves (the host seat).
-        const bool canKick = iAmHost && !slotIsHost;
+        // The host can remove any seated player except the ones on their own PC.
+        const bool canKick = iAmHost && !slotIsSelf;
         if (m_seats[slot - 1].userId != uid)
         {
             m_seats[slot - 1].iceAttempt = 1;
             m_seats[slot - 1].iceMaxAttempts = 20;
         }
         m_seats[slot - 1].userId = uid;
+        m_seats[slot - 1].peerId = peerId;
         renderSeatFilled(m_seats[slot - 1], user, slotIsHost, slotIsSelf,
                          pingMs, frameDelay, canKick, connectionType);
         const QString seatCountry = anonymous ? QString() : country;
@@ -3202,7 +3278,7 @@ void RollbackLobbyDialog::onRoomStateChanged(const QJsonObject& roomState)
         {
             for (const quint64 uid : outOfMatch)
             {
-                if (uid == selfId || m_knownSeatedUsers.contains(uid))
+                if (m_client->isOnThisPc(uid) || m_knownSeatedUsers.contains(uid))
                     continue;
                 const QString who = lobbyUserName(uid);
                 appendChatSystemLine(CHANNEL_ROOM, iAmHost
@@ -3243,16 +3319,15 @@ void RollbackLobbyDialog::onRoomStateChanged(const QJsonObject& roomState)
             const quint64 uid = static_cast<quint64>(v.toObject().value("userId").toDouble());
             if (uid != 0) currentSeated.insert(uid);
         }
-        const quint64 selfId = m_client->selfUserId();
         bool sawNewPeer = false;
-        for (const quint64 uid : currentSeated)
+        for (const auto& s : m_seats)
         {
-            if (uid == selfId || m_knownSeatedUsers.contains(uid))
+            if (s.userId == 0 || m_client->isOnThisPc(s.userId) || m_knownSeatedUsers.contains(s.userId))
                 continue;
             // Probe a newly-seated peer immediately so their ping appears within
             // an RTT instead of waiting on the next probe tick — and so this
             // player's Auto delay resolves from real ping before the match begins.
-            if (m_client) m_client->requestPingProbe(uid);
+            m_client->requestPingProbe(s.peerId);
             sawNewPeer = true;
         }
         // Chime only once we've settled in: the first ROOM_STATE's occupants were
@@ -3335,26 +3410,28 @@ void RollbackLobbyDialog::refreshStartButton()
     // run contiguously from P1. The core sizes the GekkoNet session by the
     // highest occupied seat and feeds empty ports zeroed input.
     int seated = 0;
-    QList<quint64> seatedUserIds;
+    bool otherPcSeated = false;
+    QList<quint64> seatedPeerIds;
     for (const auto& s : m_seats)
     {
         if (s.userId == 0)
             continue;
         ++seated;
-        seatedUserIds.append(s.userId);
+        otherPcSeated = otherPcSeated || s.peerId != selfId;
+        seatedPeerIds.append(s.peerId);
     }
 
-    // Alone there are no paths to measure. The server only allows it when
-    // whoever joins later can be added to the running match.
-    const bool alone = seated == 1 && m_canStartAlone;
-    const bool enoughPlayers = seated >= 2 || alone;
+    // With nobody on another PC there are no paths to measure. The server only
+    // allows it when whoever joins later can be added to the running match.
+    const bool alone = seated >= 1 && !otherPcSeated && m_canStartAlone;
+    const bool enoughPlayers = otherPcSeated || alone;
     bool pingsReady = alone;
     if (m_client && !alone)
-        m_client->worstRoomPingMs(seatedUserIds, &pingsReady);
+        m_client->worstRoomPingMs(seatedPeerIds, &pingsReady);
     const bool canStart      = iAmHost && waiting && enoughPlayers && pingsReady;
 
     m_startBtn->setEnabled(canStart);
-    m_startBtn->setText(alone ? tr("Start alone") : tr("Start Game"));
+    m_startBtn->setText(alone && seated == 1 ? tr("Start alone") : tr("Start Game"));
     m_startBtn->setVisible(iAmHost && waiting);
     m_startBtn->setToolTip(
         !iAmHost         ? tr("Only the host can start the game.")
@@ -3427,7 +3504,7 @@ void RollbackLobbyDialog::refreshStartButton()
             QString slowest;
             for (const auto& s : m_seats)
             {
-                if (s.userId != 0 && s.userId != selfId && m_client->measuredPingMs(s.userId) < 0)
+                if (s.userId != 0 && s.peerId != selfId && m_client->measuredPingMs(s.peerId) < 0)
                 {
                     slowest = s.username;
                     break;
@@ -3627,9 +3704,9 @@ void RollbackLobbyDialog::onPingProbeTick()
     {
         for (const auto& s : m_seats)
         {
-            if (s.userId == 0 || s.userId == selfId)
+            if (s.userId == 0 || s.peerId == selfId)
                 continue;
-            m_client->requestPingProbe(s.userId);
+            m_client->requestPingProbe(s.peerId);
         }
     }
 
@@ -3667,7 +3744,7 @@ void RollbackLobbyDialog::refreshSeatLink(quint64 userId)
 {
     for (auto& s : m_seats)
     {
-        if (s.userId != userId || !s.row)
+        if (s.peerId != userId || !s.row)
             continue;
         const bool isSelf = m_client && userId == m_client->selfUserId();
         const int pingMs = m_client ? m_client->measuredPingMs(userId) : -1;
@@ -3677,7 +3754,6 @@ void RollbackLobbyDialog::refreshSeatLink(quint64 userId)
             s.row->setLinkPing(pingMs);
         else
             s.row->setLinkConnecting(s.iceAttempt, s.iceMaxAttempts);
-        break;
     }
 }
 
@@ -3685,11 +3761,8 @@ void RollbackLobbyDialog::setSeatLinkStatus(quint64 userId, const QString& text,
 {
     for (auto& s : m_seats)
     {
-        if (s.userId == userId && s.row)
-        {
+        if (s.peerId == userId && s.row)
             s.row->setLinkStatus(text, role);
-            break;
-        }
     }
 }
 
@@ -3719,7 +3792,7 @@ void RollbackLobbyDialog::onIcePeerConnectionAttemptChanged(
         return;
     for (auto& seat : m_seats)
     {
-        if (seat.userId != userId)
+        if (seat.peerId != userId)
             continue;
         seat.iceMaxAttempts = std::max(1, maxAttempts);
         seat.iceAttempt = std::clamp(attempt, 1, seat.iceMaxAttempts);
@@ -3727,7 +3800,6 @@ void RollbackLobbyDialog::onIcePeerConnectionAttemptChanged(
         // until this new path connects and is measured.
         if (seat.row)
             seat.row->setLinkConnecting(seat.iceAttempt, seat.iceMaxAttempts);
-        break;
     }
 }
 
@@ -3797,10 +3869,8 @@ void RollbackLobbyDialog::onPingMeasured(quint64 userId, int rttMs)
     // whole room view on every probe response.
     for (auto& s : m_seats)
     {
-        if (s.userId != userId || !s.row)
-            continue;
-        s.row->setLinkPing(rttMs);
-        break;
+        if (s.peerId == userId && s.row)
+            s.row->setLinkPing(rttMs);
     }
 
     // Auto delay follows this player's own direct peer RTTs. Every seated client
@@ -3812,14 +3882,19 @@ void RollbackLobbyDialog::onPingMeasured(quint64 userId, int rttMs)
     // A peer's first ping may be what unblocks the host's Start button.
     refreshStartButton();
 
-    // Refresh the lobby row so the hover tooltip shows the fresh measurement.
-    const auto rowIt = m_userItems.constFind(userId);
-    if (rowIt != m_userItems.constEnd())
-    {
-        const auto& users = m_client->users();
-        const auto userIt = users.constFind(userId);
-        if (userIt != users.constEnd())
+    // Refresh the lobby rows so the hover tooltip shows the fresh measurement:
+    // this user's, and any others seated on the same connection.
+    const auto refreshRow = [this](quint64 id) {
+        const auto rowIt = m_userItems.constFind(id);
+        const auto userIt = m_client->users().constFind(id);
+        if (rowIt != m_userItems.constEnd() && userIt != m_client->users().constEnd())
             refreshPlayerRow(rowIt.value(), userIt.value());
+    };
+    refreshRow(userId);
+    for (const auto& s : m_seats)
+    {
+        if (s.peerId == userId && s.userId != userId)
+            refreshRow(s.userId);
     }
 
     // Rooms hosted by this user show your ping in the rooms column.
@@ -3840,9 +3915,9 @@ int RollbackLobbyDialog::worstLocalPeerPingMs() const
     int worst = -1;
     for (const auto& s : m_seats)
     {
-        if (s.userId == 0 || s.userId == selfId)
+        if (s.userId == 0 || s.peerId == selfId)
             continue;
-        const int ping = m_client->measuredPingMs(s.userId);
+        const int ping = m_client->measuredPingMs(s.peerId);
         if (ping >= 0)
             worst = std::max(worst, ping);
     }
@@ -3890,12 +3965,11 @@ void RollbackLobbyDialog::applyLocalFrameDelay(bool force)
         const quint64 selfId = m_client->selfUserId();
         for (auto& seat : m_seats)
         {
-            if (seat.userId != selfId)
+            if (seat.peerId != selfId)
                 continue;
             seat.frameDelay = delay;
             if (seat.row)
                 seat.row->setDelay(delay);
-            break;
         }
     }
 
@@ -3999,9 +4073,9 @@ void RollbackLobbyDialog::refreshSettingHints()
         QString worstName;
         for (const auto& s : m_seats)
         {
-            if (s.userId == 0 || s.userId == selfId)
+            if (s.userId == 0 || s.peerId == selfId)
                 continue;
-            const int ping = m_client->measuredPingMs(s.userId);
+            const int ping = m_client->measuredPingMs(s.peerId);
             if (ping > worst)
             {
                 worst = ping;
@@ -4049,7 +4123,10 @@ void RollbackLobbyDialog::onRoomLeft(const QString& reason)
         emit closeMatchRequested();
 
     for (auto& s : m_seats)
+    {
         s.userId = 0;
+        s.peerId = 0;
+    }
 
     m_currentRoomId = 0;
     m_currentRoomGame.clear();
@@ -4074,6 +4151,7 @@ void RollbackLobbyDialog::onRoomLeft(const QString& reason)
     if (m_chatViewRoom) m_chatViewRoom->clear();
     setRoomChatVisible(false);
 
+    refreshLocalRoster();
     switchToRoomsView();
     if (m_startBtn) m_startBtn->setEnabled(false);
     if (m_dropBtn)  m_dropBtn->setEnabled(false);
@@ -4455,6 +4533,11 @@ void RollbackLobbyDialog::onQuickMatchClicked()
                 tr("Leave your current room before searching for a match."));
             return;
         }
+        if (m_client->seatsOnThisPc() > 1)
+        {
+            onQuickMatchRefused(QStringLiteral("local_players"));
+            return;
+        }
 
         const QVariantMap romData = selectedBrowseRom();
         const QString romName = romData.value("name").toString();
@@ -4485,6 +4568,320 @@ void RollbackLobbyDialog::onQuickMatchStatusChanged(bool searching, int queueSiz
                                     m_client->state() == LobbyClient::ConnectionState::Connected &&
                                     m_currentRoomId == 0);
     refreshPlayBar();
+    refreshLocalRoster();
+}
+
+void RollbackLobbyDialog::onQuickMatchRefused(const QString& reason)
+{
+    QMessageBox::information(this, tr("Quick Match"),
+        reason == QStringLiteral("local_players")
+            ? tr("Quick Match pairs two players, one on each PC. "
+                 "Remove the other players on this PC, or create a room to play together.")
+            : reason);
+}
+
+// ── Other players on this PC ──────────────────────────────────────────
+//
+// They sit under this client's own row. Everything that happens to one of them
+// happens to all: they take seats together when this client creates or joins a
+// room, and leave, get kicked, drop and join a running match together. So the
+// roster only changes out here in the lobby.
+
+namespace
+{
+    constexpr int kMaxPlayersOnPc = 4; // the lobby's limit too
+    constexpr const char* kLocalNamesSetting = "Lobby/LocalPlayers/Names";
+
+    // Whether the player has turned this controller on. Only RMG-Input has an
+    // on switch per controller; other input plugins decide for themselves.
+    bool localControllerOn(int controller)
+    {
+        if (CoreSettingsGetStringValue(SettingsID::Core_INPUT_Plugin).find("RMG-Input") == std::string::npos)
+            return true;
+        const std::string section = "Rosalie's Mupen GUI - Input Plugin Profile " + std::to_string(controller);
+        return CoreSettingsSectionExists(section) &&
+               CoreSettingsGetBoolValue(SettingsID::Input_PluggedIn, section);
+    }
+}
+
+void RollbackLobbyDialog::buildLocalRoster()
+{
+    m_rosterBox = new QWidget(m_playersTree->parentWidget());
+    m_rosterBox->setObjectName("LocalRoster");
+    auto* lay = new QVBoxLayout(m_rosterBox);
+    lay->setContentsMargins(4, 3, 4, 5);
+    lay->setSpacing(3);
+
+    m_rosterRows = new QVBoxLayout;
+    m_rosterRows->setContentsMargins(0, 0, 0, 0);
+    m_rosterRows->setSpacing(2);
+    lay->addLayout(m_rosterRows);
+
+    m_rosterEditor = new QWidget(m_rosterBox);
+    auto* editorLay = new QHBoxLayout(m_rosterEditor);
+    editorLay->setContentsMargins(0, 0, 0, 0);
+    editorLay->setSpacing(4);
+    m_rosterName = new QLineEdit(m_rosterEditor);
+    m_rosterName->setObjectName("LocalPlayerName");
+    m_rosterName->setFont(LobbyTheme::uiFont(12));
+    m_rosterName->setPlaceholderText(tr("Name"));
+    m_rosterName->setMaxLength(20);
+    m_rosterName->setValidator(new QRegularExpressionValidator(
+        QRegularExpression(QStringLiteral(R"([A-Za-z0-9_\-\.]{1,20})")), m_rosterName));
+    m_rosterController = new QComboBox(m_rosterEditor);
+    m_rosterController->setObjectName("LocalPlayerController");
+    m_rosterController->setFont(LobbyTheme::uiFont(11));
+    m_rosterController->setToolTip(tr("The controller they play on. Set controllers up in Input settings."));
+    auto* confirm = new IconButton(QStringLiteral("check-line"), 24, m_rosterEditor);
+    confirm->setObjectName("LocalPlayerConfirm");
+    confirm->setToolTip(tr("Add"));
+    confirm->setAccessibleName(tr("Add"));
+    auto* cancel = new IconButton(QStringLiteral("close-line"), 24, m_rosterEditor);
+    cancel->setObjectName("LocalPlayerCancel");
+    cancel->setToolTip(tr("Cancel"));
+    cancel->setAccessibleName(tr("Cancel"));
+    editorLay->addWidget(m_rosterName, 1);
+    editorLay->addWidget(m_rosterController);
+    editorLay->addWidget(confirm);
+    editorLay->addWidget(cancel);
+    m_rosterEditor->setVisible(false);
+    lay->addWidget(m_rosterEditor);
+
+    m_rosterError = new QLabel(m_rosterBox);
+    m_rosterError->setFont(LobbyTheme::uiFont(11));
+    m_rosterError->setProperty("role", "bad");
+    m_rosterError->setWordWrap(true);
+    m_rosterError->setVisible(false);
+    lay->addWidget(m_rosterError);
+
+    m_rosterAdd = new LobbyButton(tr("Add a player on this PC"), LobbyButton::Kind::Ghost, m_rosterBox);
+    m_rosterAdd->setObjectName("AddLocalPlayerBtn");
+    m_rosterAdd->setButtonSize(LobbyButton::Size::Small);
+    m_rosterAdd->setIconName(QStringLiteral("user-add-line"));
+    lay->addWidget(m_rosterAdd);
+
+    connect(m_rosterAdd, &QPushButton::clicked, this, &RollbackLobbyDialog::openRosterEditor);
+    m_rosterName->installEventFilter(this);
+    connect(confirm, &QToolButton::clicked, this, &RollbackLobbyDialog::submitRosterEditor);
+    connect(cancel, &QToolButton::clicked, this, &RollbackLobbyDialog::closeRosterEditor);
+
+    refreshLocalRoster();
+}
+
+// Controllers 2-4 that no other local player has. The first is the owner's.
+void RollbackLobbyDialog::fillControllerCombo(QComboBox* combo, int current, quint64 exceptUserId) const
+{
+    QSet<int> taken;
+    for (const auto& player : m_client->localPlayers())
+    {
+        if (player.userId != exceptUserId)
+            taken.insert(player.controller);
+    }
+    const QSignalBlocker blocker(combo);
+    combo->clear();
+    for (int controller = 1; controller < kMaxPlayersOnPc; ++controller)
+    {
+        if (taken.contains(controller))
+            continue;
+        combo->addItem(localControllerOn(controller)
+                           ? tr("Controller %1").arg(controller + 1)
+                           : tr("Controller %1 (off)").arg(controller + 1),
+                       controller);
+    }
+    combo->setCurrentIndex(std::max(0, combo->findData(current)));
+}
+
+// The next controller that's turned on, or else the next one free.
+int RollbackLobbyDialog::nextFreeController() const
+{
+    QSet<int> taken;
+    for (const auto& player : m_client->localPlayers())
+        taken.insert(player.controller);
+    int firstFree = -1;
+    for (int controller = 1; controller < kMaxPlayersOnPc; ++controller)
+    {
+        if (taken.contains(controller))
+            continue;
+        if (localControllerOn(controller))
+            return controller;
+        if (firstFree < 0)
+            firstFree = controller;
+    }
+    return firstFree;
+}
+
+QString RollbackLobbyDialog::nextRememberedLocalName() const
+{
+    QSettings s("RMG-K", "n02");
+    for (const QString& name : s.value(kLocalNamesSetting).toStringList())
+    {
+        if (!m_client->users().isEmpty() && std::none_of(m_client->users().cbegin(), m_client->users().cend(),
+                [&name](const LobbyClient::LobbyUser& u) { return u.username.compare(name, Qt::CaseInsensitive) == 0; }))
+            return name;
+    }
+    return QString();
+}
+
+void RollbackLobbyDialog::openRosterEditor()
+{
+    m_rosterError->setVisible(false);
+    m_rosterName->setText(nextRememberedLocalName());
+    fillControllerCombo(m_rosterController, nextFreeController(), 0);
+    m_rosterEditor->setVisible(true);
+    m_rosterName->setFocus();
+    m_rosterName->selectAll();
+    refreshLocalRoster();
+}
+
+void RollbackLobbyDialog::closeRosterEditor()
+{
+    m_rosterSubmittedName.clear();
+    m_rosterEditor->setVisible(false);
+    m_rosterError->setVisible(false);
+    refreshLocalRoster();
+}
+
+void RollbackLobbyDialog::submitRosterEditor()
+{
+    const QString name = m_rosterName->text().trimmed();
+    if (name.size() < 2)
+    {
+        onLocalPlayerFailed(name, QStringLiteral("invalid_name"));
+        return;
+    }
+    m_rosterSubmittedName = name;
+    m_client->addLocalPlayer(name, m_rosterController->currentData().toInt());
+}
+
+void RollbackLobbyDialog::onLocalPlayerFailed(const QString& name, const QString& reason)
+{
+    Q_UNUSED(name);
+    m_rosterSubmittedName.clear();
+    QString why;
+    if (reason == QStringLiteral("invalid_name"))
+        why = tr("Names are 2 to 20 letters, numbers, or _ - . and can't be offensive.");
+    else if (reason == QStringLiteral("name_taken"))
+        why = tr("Someone in the lobby already has that name.");
+    else if (reason == QStringLiteral("too_many"))
+        why = tr("One PC can have up to %1 players.").arg(kMaxPlayersOnPc);
+    else if (reason == QStringLiteral("in_room"))
+        why = tr("Leave the room to change who's playing on this PC.");
+    else if (reason == QStringLiteral("searching"))
+        why = tr("Stop searching to change who's playing on this PC.");
+    else if (reason == QStringLiteral("too_fast"))
+        why = tr("That's a lot of changes at once. Try again in a moment.");
+    else
+        why = tr("The lobby refused that (%1).").arg(reason);
+    m_rosterError->setText(why);
+    m_rosterError->setVisible(true);
+    refreshLocalRoster();
+}
+
+void RollbackLobbyDialog::refreshLocalRoster()
+{
+    if (!m_rosterBox || !m_client)
+        return;
+
+    const bool available = m_client->state() == LobbyClient::ConnectionState::Connected &&
+        m_client->localPlayersSupported();
+    const bool locked = m_currentRoomId != 0 || m_quickMatchActive;
+    const QString lockedWhy = m_currentRoomId != 0
+        ? tr("Leave the room to change who's playing on this PC.")
+        : tr("Stop searching to change who's playing on this PC.");
+    const auto& players = m_client->localPlayers();
+
+    // The player the editor asked for has arrived: remember their name for next
+    // time. The roster itself lasts only as long as the connection.
+    if (!m_rosterSubmittedName.isEmpty() &&
+        std::any_of(players.cbegin(), players.cend(), [this](const LobbyClient::LocalPlayer& player) {
+            return player.name == m_rosterSubmittedName;
+        }))
+    {
+        QSettings s("RMG-K", "n02");
+        QStringList names = s.value(kLocalNamesSetting).toStringList();
+        names.removeAll(m_rosterSubmittedName);
+        names.prepend(m_rosterSubmittedName);
+        s.setValue(kLocalNamesSetting, names.mid(0, 8));
+        m_rosterSubmittedName.clear();
+        m_rosterEditor->setVisible(false);
+        m_rosterError->setVisible(false);
+    }
+    if (locked || !available)
+        m_rosterEditor->setVisible(false);
+
+    while (QLayoutItem* item = m_rosterRows->takeAt(0))
+    {
+        if (QWidget* widget = item->widget())
+        {
+            widget->hide();
+            widget->deleteLater();
+        }
+        delete item;
+    }
+    for (const auto& player : players)
+    {
+        auto* row = new QWidget(m_rosterBox);
+        auto* rowLay = new QHBoxLayout(row);
+        rowLay->setContentsMargins(3, 0, 0, 0);
+        rowLay->setSpacing(4);
+
+        auto* name = new ElidedLabel(LobbyTheme::Role::Ink, row);
+        name->setFont(LobbyTheme::uiFont(12));
+        name->setText(player.name);
+        rowLay->addWidget(name, 1);
+
+        auto* combo = new QComboBox(row);
+        combo->setFont(LobbyTheme::uiFont(11));
+        fillControllerCombo(combo, player.controller, player.userId);
+        combo->setEnabled(!locked);
+        combo->setToolTip(locked ? lockedWhy
+            : localControllerOn(player.controller)
+                ? tr("The controller %1 plays on.").arg(player.name)
+                : tr("This controller is off. Turn it on in Input settings before playing."));
+        const quint64 userId = player.userId;
+        connect(combo, QOverload<int>::of(&QComboBox::activated), this, [this, combo, userId](int) {
+            m_client->setLocalPlayerController(userId, combo->currentData().toInt());
+        });
+        rowLay->addWidget(combo);
+
+        auto* remove = new IconButton(QStringLiteral("close-line"), 22, row);
+        remove->setEnabled(!locked);
+        remove->setToolTip(locked ? lockedWhy : tr("Remove %1 from this PC").arg(player.name));
+        remove->setAccessibleName(tr("Remove %1 from this PC").arg(player.name));
+        connect(remove, &QToolButton::clicked, this, [this, userId]() {
+            m_client->removeLocalPlayer(userId);
+        });
+        rowLay->addWidget(remove);
+
+        m_rosterRows->addWidget(row);
+    }
+
+    m_rosterAdd->setVisible(available && !m_rosterEditor->isVisibleTo(m_rosterBox) &&
+                            m_client->seatsOnThisPc() < kMaxPlayersOnPc);
+    m_rosterAdd->setEnabled(!locked);
+    m_rosterAdd->setToolTip(locked ? lockedWhy
+        : tr("Play with someone else on this PC. They join every room with you, on their own controller."));
+
+    m_rosterBox->setVisible(available);
+
+    // Whether a room fits depends on how many are on this PC.
+    if (m_rosterSeatsShown != m_client->seatsOnThisPc())
+    {
+        m_rosterSeatsShown = m_client->seatsOnThisPc();
+        onRoomListChanged();
+    }
+}
+
+void RollbackLobbyDialog::warnAboutLocalControllers()
+{
+    for (const auto& player : m_client->localPlayers())
+    {
+        if (!localControllerOn(player.controller))
+            appendChatSystemLine(CHANNEL_ROOM,
+                tr("%1 can't play yet: controller %2 is off. Turn it on in Input settings.")
+                    .arg(player.name).arg(player.controller + 1),
+                QStringLiteral("gamepad-line"), Role::Warn);
+    }
 }
 
 // ── Broadcaster ───────────────────────────────────────────────────────
@@ -4785,7 +5182,7 @@ void RollbackLobbyDialog::onMatchBegin(quint64 matchId, const QList<LobbyClient:
     if (!m_client->allIcePeersConnected(peers, &iceError))
     {
         const bool unsupported = std::any_of(peers.cbegin(), peers.cend(), [this](const auto& peer) {
-            return peer.userId != m_client->selfUserId() && !peer.iceSupported;
+            return peer.peerId != m_client->selfUserId() && !peer.iceSupported;
         });
         const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
         if (m_iceWaitingMatchId != matchId)
@@ -4819,7 +5216,9 @@ void RollbackLobbyDialog::onMatchBegin(quint64 matchId, const QList<LobbyClient:
     appendChatSystemLine(CHANNEL_LOBBY, line);
     appendChatSystemLine(CHANNEL_ROOM,  line);
 
-    m_playingAlone = peers.size() == 1;
+    m_playingAlone = std::all_of(peers.cbegin(), peers.cend(), [this](const auto& peer) {
+        return peer.peerId == m_client->selfUserId();
+    });
     if (m_playingAlone && m_delayAuto && m_currentRoomDelay != 0)
     {
         m_currentRoomDelay = 0;
@@ -4849,6 +5248,7 @@ void RollbackLobbyDialog::onMatchBegin(quint64 matchId, const QList<LobbyClient:
     if (m_playingAlone)
         appendChatSystemLine(CHANNEL_ROOM,
             tr("You're playing alone for now. When someone joins the room, click Add to Game on their seat."));
+    warnAboutLocalControllers();
 
     m_currentMatchId = matchId;
     m_awaitingEmulationStart = true;
@@ -4934,15 +5334,20 @@ void RollbackLobbyDialog::onMatchBegin(quint64 matchId, const QList<LobbyClient:
 
     const quint16 localPort = 0;
 
+    QStringList localSeats;
     for (const auto& p : peers)
     {
-        if (p.userId == selfId)
+        if (p.peerId == selfId)
+        {
+            if (p.userId != selfId)
+                localSeats << QString("local=%1:%2").arg(p.slot).arg(m_client->localPlayerController(p.userId));
             continue;
+        }
 
         const QString selectedLine = QString("Rollback lobby selected ICE peer: peerUser=%1 slot=%2")
-            .arg(p.userId).arg(p.slot);
+            .arg(p.peerId).arg(p.slot);
         CoreAddCallbackMessage(CoreDebugMessageType::Info, selectedLine.toUtf8().constData());
-        remotePeers << QString("%1,ice,%2").arg(p.slot).arg(p.userId);
+        remotePeers << QString("%1,ice,%2").arg(p.slot).arg(p.peerId);
     }
 
     // Nobody else is fine only in a match someone can join later.
@@ -4955,6 +5360,7 @@ void RollbackLobbyDialog::onMatchBegin(quint64 matchId, const QList<LobbyClient:
     // newcomer takes over an idle controller instead of changing the machine.
     if (m_client->matchSeats() > 0)
         remotePeers << QString("seats=%1").arg(m_client->matchSeats());
+    remotePeers << localSeats;
 
     const QString localRomFile = localRomPathForMd5(m_currentRoomMd5);
     if (localRomFile.isEmpty())
@@ -4965,7 +5371,7 @@ void RollbackLobbyDialog::onMatchBegin(quint64 matchId, const QList<LobbyClient:
 
     appendChatSystemLine(CHANNEL_ROOM, tr("Synchronizing pre-match settings..."));
     QString prematchError;
-    if (!m_client->syncPrematchManifest(peers, local.slot, m_currentRoomHostId,
+    if (!m_client->syncPrematchManifest(LobbyClient::connectionPeers(peers), local.slot, m_currentRoomHostId,
                                         localRomFile, prematchError))
     {
         abortMatchStart(prematchError.isEmpty() ? tr("Pre-match sync failed.") : prematchError);
@@ -5058,6 +5464,24 @@ QString RollbackLobbyDialog::lobbyUserName(quint64 userId) const
     return QString::number(userId);
 }
 
+QString RollbackLobbyDialog::lateJoinNames() const
+{
+    QStringList names;
+    for (const auto& joiner : m_lateJoin.joiners)
+        names << joiner.username;
+    if (names.size() < 2)
+        return m_lateJoin.joiner.username;
+    const QString last = names.takeLast();
+    return tr("%1 and %2").arg(names.join(QStringLiteral(", ")), last);
+}
+
+QString RollbackLobbyDialog::lateJoinBanner() const
+{
+    return m_lateJoin.joiners.size() > 1
+        ? tr("%1 are joining the game").arg(lateJoinNames())
+        : tr("%1 is joining the game").arg(lateJoinNames());
+}
+
 void RollbackLobbyDialog::onAdmitClicked(quint64 userId)
 {
     if (!m_client || m_currentMatchId == 0 || !m_emulationActive ||
@@ -5091,6 +5515,7 @@ void RollbackLobbyDialog::onMatchAdmitFailed(quint64 matchId, quint64 userId, co
 
 void RollbackLobbyDialog::onMatchAdmitBegin(quint64 matchId, quint64 admitId, int epoch, int seats,
                                             quint64 hostId, const LobbyClient::LobbyMatchPeer& joiner,
+                                            const QList<LobbyClient::LobbyMatchPeer>& joiners,
                                             const QList<LobbyClient::LobbyMatchPeer>& peers)
 {
     const quint64 selfId = m_client ? m_client->selfUserId() : 0;
@@ -5104,6 +5529,7 @@ void RollbackLobbyDialog::onMatchAdmitBegin(quint64 matchId, quint64 admitId, in
     m_lateJoin.seats = seats;
     m_lateJoin.hostId = hostId;
     m_lateJoin.joiner = joiner;
+    m_lateJoin.joiners = joiners;
     m_lateJoin.peers = peers;
     m_lateJoin.startedMs = QDateTime::currentMSecsSinceEpoch();
     m_admitRequestedUserId = 0;
@@ -5115,7 +5541,7 @@ void RollbackLobbyDialog::onMatchAdmitBegin(quint64 matchId, quint64 admitId, in
         if (m_spectatingMatchId != 0)
             stopSpectating();
         for (const auto& peer : peers)
-            m_client->ensureIcePeer(peer.userId);
+            m_client->ensureIcePeer(peer.peerId);
         appendChatSystemLine(CHANNEL_ROOM, tr("The host is adding you to the game…"));
         applyRoomStateBadge(tr("Joining the game…"), stateHex("connecting", isDarkTheme()));
     }
@@ -5137,9 +5563,9 @@ void RollbackLobbyDialog::onMatchAdmitBegin(quint64 matchId, quint64 admitId, in
         }
         else
         {
-            appendChatSystemLine(CHANNEL_ROOM, tr("The host is adding %1 to the game…").arg(joiner.username));
+            appendChatSystemLine(CHANNEL_ROOM, tr("The host is adding %1 to the game…").arg(lateJoinNames()));
         }
-        emit overlayMessage(tr("%1 is joining the game…").arg(joiner.username));
+        emit overlayMessage(lateJoinBanner() + QStringLiteral("…"));
     }
     else
     {
@@ -5203,7 +5629,7 @@ void RollbackLobbyDialog::onMatchAdmitStep(quint64 matchId, quint64 admitId, qui
             m_lateJoin.cutFrame = frame;
             m_lateJoin.cutSentMs = QDateTime::currentMSecsSinceEpoch();
             rmgk_gekko::arm_admit_cut(frame, false);
-            emit overlayCenterMessage(tr("%1 is joining the game").arg(m_lateJoin.joiner.username));
+            emit overlayCenterMessage(lateJoinBanner());
         }
         else if (step == QStringLiteral("go") && m_lateJoin.cutFrame > 0)
         {
@@ -5278,11 +5704,14 @@ void RollbackLobbyDialog::launchAsLateJoiner()
             std::strncpy(recording_player_names[peer.slot - 1], nameBytes.constData(), 31);
             recording_player_names[peer.slot - 1][31] = '\0';
         }
-        if (peer.userId != selfId)
-            remotePeers << QString("%1,ice,%2").arg(peer.slot).arg(peer.userId);
+        if (peer.peerId != selfId)
+            remotePeers << QString("%1,ice,%2").arg(peer.slot).arg(peer.peerId);
+        else if (peer.userId != selfId)
+            remotePeers << QString("local=%1:%2").arg(peer.slot).arg(m_client->localPlayerController(peer.userId));
     }
     remotePeers << QString("seats=%1").arg(m_lateJoin.seats)
                 << QString("join=%1").arg(m_lateJoin.epoch);
+    warnAboutLocalControllers();
 
     m_currentMatchId = m_lateJoin.matchId;
     m_awaitingEmulationStart = true;
@@ -5310,11 +5739,11 @@ std::vector<LobbyRemotePeer> RollbackLobbyDialog::lateJoinRemotes() const
     const quint64 selfId = m_client ? m_client->selfUserId() : 0;
     for (const auto& peer : m_lateJoin.peers)
     {
-        if (peer.userId == selfId || m_lateJoin.left.contains(peer.userId))
+        if (peer.peerId == selfId || m_lateJoin.left.contains(peer.userId))
             continue;
         LobbyRemotePeer remote;
         remote.slot = peer.slot;
-        remote.userId = peer.userId;
+        remote.userId = peer.peerId;
         remotes.push_back(remote);
     }
     return remotes;
@@ -5340,13 +5769,13 @@ void RollbackLobbyDialog::armLateJoinCut()
     m_lateJoin.awaitingCut.clear();
     for (const auto& peer : m_lateJoin.peers)
     {
-        if (peer.userId != m_client->selfUserId() && peer.userId != m_lateJoin.joiner.userId &&
+        if (peer.peerId != m_client->selfUserId() && peer.peerId != m_lateJoin.joiner.userId &&
             !m_lateJoin.left.contains(peer.userId))
-            m_lateJoin.awaitingCut.insert(peer.userId);
+            m_lateJoin.awaitingCut.insert(peer.peerId);
     }
     rmgk_gekko::arm_admit_cut(m_lateJoin.cutFrame, true);
     m_client->sendAdmitStep(m_lateJoin.matchId, m_lateJoin.admitId, QStringLiteral("cut"), m_lateJoin.cutFrame);
-    emit overlayCenterMessage(tr("%1 is joining the game").arg(m_lateJoin.joiner.username));
+    emit overlayCenterMessage(lateJoinBanner());
 }
 
 // The joiner checks its side before saying it's ready, but a new session that
@@ -5358,14 +5787,17 @@ bool RollbackLobbyDialog::connectedToLateJoiner() const
 
 void RollbackLobbyDialog::applyLateJoinRoster()
 {
-    // Label the joiner's port in the overlay (and, on the host, in nothing
+    // Label the joiners' ports in the overlay (and, on the host, in nothing
     // else: the replay header was written when the match began).
-    const int slot = m_lateJoin.joiner.slot;
-    if (slot >= 1 && slot <= 4)
+    for (const auto& joiner : m_lateJoin.joiners)
     {
-        const QByteArray nameBytes = m_lateJoin.joiner.username.toUtf8();
-        std::strncpy(recording_player_names[slot - 1], nameBytes.constData(), 31);
-        recording_player_names[slot - 1][31] = '\0';
+        const int slot = joiner.slot;
+        if (slot >= 1 && slot <= 4)
+        {
+            const QByteArray nameBytes = joiner.username.toUtf8();
+            std::strncpy(recording_player_names[slot - 1], nameBytes.constData(), 31);
+            recording_player_names[slot - 1][31] = '\0';
+        }
     }
     emit portLabelsChanged();
 }
@@ -5484,7 +5916,7 @@ void RollbackLobbyDialog::onLateJoinTick()
             QList<LobbyClient::LobbyMatchPeer> others;
             for (const auto& peer : lj.peers)
             {
-                if (peer.userId != m_client->selfUserId() && !lj.left.contains(peer.userId))
+                if (peer.peerId != m_client->selfUserId() && !lj.left.contains(peer.userId))
                     others.append(peer);
             }
             const bool connected = m_client->allIcePeersConnected(others);
@@ -5525,28 +5957,35 @@ void RollbackLobbyDialog::onLateJoinTick()
 void RollbackLobbyDialog::finishLateJoin(bool resumed)
 {
     const LateJoinRole role = m_lateJoin.role;
-    const QString name = m_lateJoin.joiner.username;
-    const int slot = m_lateJoin.joiner.slot;
+    const QString names = lateJoinNames();
+    const quint64 selfId = m_client ? m_client->selfUserId() : 0;
+    const QList<LobbyClient::LobbyMatchPeer> joiners = m_lateJoin.joiners;
     m_lateJoin = LateJoin{};
     if (m_lateJoinTimer)
         m_lateJoinTimer->stop();
     emit overlayCenterMessage(QString());
 
-    if (role == LateJoinRole::Joiner)
+    if (role == LateJoinRole::Joiner || resumed)
     {
-        appendChatSystemLine(CHANNEL_ROOM, tr("You joined the game as P%1.").arg(slot));
-        emit overlayMessage(tr("You joined the game as P%1").arg(slot));
-    }
-    else if (resumed)
-    {
-        appendChatSystemLine(CHANNEL_ROOM, tr("%1 joined the game as P%2.").arg(name).arg(slot));
-        emit overlayMessage(tr("%1 joined the game as P%2").arg(name).arg(slot));
+        for (const auto& joiner : joiners)
+        {
+            if (joiner.userId == selfId)
+            {
+                appendChatSystemLine(CHANNEL_ROOM, tr("You joined the game as P%1.").arg(joiner.slot));
+                emit overlayMessage(tr("You joined the game as P%1").arg(joiner.slot));
+            }
+            else
+            {
+                appendChatSystemLine(CHANNEL_ROOM, tr("%1 joined the game as P%2.").arg(joiner.username).arg(joiner.slot));
+                emit overlayMessage(tr("%1 joined the game as P%2").arg(joiner.username).arg(joiner.slot));
+            }
+        }
     }
     else
     {
         // The new session is still waiting for the joiner; if they never
         // connect, the lobby drops them and play continues without them.
-        appendChatSystemLine(CHANNEL_ROOM, tr("Still waiting for %1 to connect…").arg(name));
+        appendChatSystemLine(CHANNEL_ROOM, tr("Still waiting for %1 to connect…").arg(names));
     }
     refreshAdmitButtons();
 }
@@ -5556,6 +5995,7 @@ void RollbackLobbyDialog::abortLateJoin(const QString& reason, bool tellOthers)
     const LateJoin lj = m_lateJoin;
     if (lj.role == LateJoinRole::None)
         return;
+    const QString names = lateJoinNames();
     m_lateJoin = LateJoin{};
     if (m_lateJoinTimer)
         m_lateJoinTimer->stop();
@@ -5610,8 +6050,8 @@ void RollbackLobbyDialog::abortLateJoin(const QString& reason, bool tellOthers)
         // A cut that was never released is dropped and play goes on.
         if (!lj.released)
             rmgk_gekko::cancel_admit_cut();
-        appendChatSystemLine(CHANNEL_ROOM, tr("Couldn't add %1: %2.").arg(lj.joiner.username, why));
-        emit overlayMessage(tr("%1 couldn't join").arg(lj.joiner.username));
+        appendChatSystemLine(CHANNEL_ROOM, tr("Couldn't add %1: %2.").arg(names, why));
+        emit overlayMessage(tr("%1 couldn't join").arg(names));
     }
     refreshAdmitButtons();
 }
@@ -5622,14 +6062,21 @@ void RollbackLobbyDialog::refreshAdmitButtons()
     const bool canAdmit = iAmHost && m_roomLateJoin && m_currentRoomState == "in_game" &&
         m_emulationActive && m_currentMatchId != 0;
     const bool busy = m_lateJoin.role != LateJoinRole::None || m_admitRequestedUserId != 0;
+    // Adding one player on a PC adds them all.
+    quint64 admitRequestedPeer = 0;
+    for (const auto& seat : m_seats)
+    {
+        if (m_admitRequestedUserId != 0 && seat.userId == m_admitRequestedUserId)
+            admitRequestedPeer = seat.peerId;
+    }
     for (auto& seat : m_seats)
     {
         if (!seat.row)
             continue;
         const bool waiting = seat.userId != 0 && m_outOfMatchUsers.contains(seat.userId) &&
             m_lateJoinCapableUsers.contains(seat.userId);
-        const bool joiningThis = m_admitRequestedUserId == seat.userId ||
-            (m_lateJoin.role != LateJoinRole::None && m_lateJoin.joiner.userId == seat.userId);
+        const bool joiningThis = (admitRequestedPeer != 0 && admitRequestedPeer == seat.peerId) ||
+            (m_lateJoin.role != LateJoinRole::None && m_lateJoin.joiner.userId == seat.peerId);
         LobbyButton* admit = seat.row->admitButton();
         seat.row->setAdmitVisible(canAdmit && waiting);
         admit->setEnabled(!busy);

@@ -46,6 +46,7 @@ struct LiveMatchView
     qint64 startedAtMs = 0;
     int viewers = 0;
     int openSeats = 0;        // seats a late joiner may take
+    int seatsNeeded = 1;      // seats this client's players take together
     bool hasRom = true;
     bool sameGame = false;    // matches the game selected in the picker
     bool watching = false;    // this client is watching this match
@@ -72,6 +73,7 @@ struct RoomRowView
     bool mine = false;
     bool hasRom = true;
     bool sameGame = false;
+    int seatsNeeded = 1;      // seats this client's players take together
 };
 
 class MatchCardBase;

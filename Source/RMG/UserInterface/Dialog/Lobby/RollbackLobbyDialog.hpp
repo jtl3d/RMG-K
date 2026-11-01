@@ -35,6 +35,7 @@ class QTreeWidget;
 class QTreeWidgetItem;
 class QTextEdit;
 class QLineEdit;
+class QVBoxLayout;
 class QPushButton;
 class QSplitter;
 class QStackedWidget;
@@ -191,6 +192,7 @@ private slots:
     void onMatchPeerLeft(quint64 matchId, quint64 userId, int slot, const QString& reason);
     void onMatchAdmitBegin(quint64 matchId, quint64 admitId, int epoch, int seats, quint64 hostId,
                            const LobbyClient::LobbyMatchPeer& joiner,
+                           const QList<LobbyClient::LobbyMatchPeer>& joiners,
                            const QList<LobbyClient::LobbyMatchPeer>& peers);
     void onMatchAdmitStep(quint64 matchId, quint64 admitId, quint64 fromUserId, const QString& step,
                           int frame, bool ok, const QString& reason);
@@ -363,6 +365,7 @@ private:
         bool     canKick   = false;
         QString  username;
         quint64  userId    = 0;           // seated user, 0 when empty
+        quint64  peerId    = 0;           // the connection they play through, 0 when empty
         int      slot      = 0;           // 1-4, drives the per-player accent color
         int      frameDelay = -1;          // published local input delay
         int      iceAttempt = 1;            // current ICE generation, one-based
@@ -426,6 +429,30 @@ private:
     QTreeWidget* m_playersTree   = nullptr;
     QLabel*      m_playersCount  = nullptr;
     QLineEdit*   m_playersSearch = nullptr;
+    // This client's own row, fixed above the scrolling list, then the other
+    // players on this PC. Each plays on their own controller; see
+    // LobbyClient::LocalPlayer.
+    QTreeWidget* m_selfRow = nullptr;
+    void buildLocalRoster();
+    void refreshLocalRoster();
+    void openRosterEditor();
+    void closeRosterEditor();
+    void submitRosterEditor();
+    void onLocalPlayerFailed(const QString& name, const QString& reason);
+    void onQuickMatchRefused(const QString& reason);
+    void fillControllerCombo(QComboBox* combo, int current, quint64 exceptUserId) const;
+    int nextFreeController() const;
+    QString nextRememberedLocalName() const;
+    void warnAboutLocalControllers();
+    QWidget*     m_rosterBox      = nullptr;
+    QVBoxLayout* m_rosterRows     = nullptr;
+    QWidget*     m_rosterEditor   = nullptr;
+    QLineEdit*   m_rosterName     = nullptr;
+    QComboBox*   m_rosterController = nullptr;
+    QLabel*      m_rosterError    = nullptr;
+    LobbyButton* m_rosterAdd      = nullptr;
+    QString      m_rosterSubmittedName; // sent to the server, not answered yet
+    int          m_rosterSeatsShown = 1; // the room list was last drawn for this many
     QList<QTreeWidgetItem*> m_playerGroups; // one heading per state
     // Last on-demand probe per user id, for probeOnDemand's throttle.
     QHash<quint64, qint64> m_lastOnDemandProbe;
@@ -590,7 +617,8 @@ private:
         int epoch = 0;
         int seats = 0;
         quint64 hostId = 0;
-        LobbyClient::LobbyMatchPeer joiner;
+        LobbyClient::LobbyMatchPeer joiner;       // whose client speaks for the PC joining
+        QList<LobbyClient::LobbyMatchPeer> joiners; // every player it adds, joiner first
         QList<LobbyClient::LobbyMatchPeer> peers; // roster after the join
         QSet<quint64> left;                       // players who left mid hand-off
         qint64 startedMs = 0;
@@ -621,6 +649,10 @@ private:
     quint64 m_admitRequestedUserId = 0;   // host clicked Add; no answer yet
     bool m_announcedWaitingSelf = false;
     QString lobbyUserName(quint64 userId) const;
+    // Who a late join adds: "Mira", or "Mira and Sam".
+    QString lateJoinNames() const;
+    // The banner above a running match while they're added.
+    QString lateJoinBanner() const;
     void onAdmitClicked(quint64 userId);
     void launchAsLateJoiner();
     std::vector<LobbyRemotePeer> lateJoinRemotes() const;

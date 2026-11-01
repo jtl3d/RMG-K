@@ -428,7 +428,7 @@ public:
         m_viewers->setText(QString::number(view.viewers));
         updateDuration();
 
-        const bool canJoin = view.openSeats > 0 && view.hasRom && !view.inRoom &&
+        const bool canJoin = view.openSeats > 0 && view.openSeats >= view.seatsNeeded && view.hasRom && !view.inRoom &&
                              !view.watching && !view.watchingOther;
         applyWatchButton(m_watch, canJoin);
         m_noRom->setVisible(!view.hasRom);
@@ -1056,12 +1056,15 @@ public:
         m_ping->setToolTip(pingTip);
 
         const bool full = view.maxPlayers > 0 && view.players >= view.maxPlayers;
+        // Everyone on this PC sits down together or nobody does.
+        const int freeSeats = view.maxPlayers - view.players;
+        const bool tooFewSeats = view.maxPlayers > 0 && !full && view.seatsNeeded > freeSeats;
         m_name->setRole(view.mine ? Role::Accent : view.hasRom ? Role::Ink : Role::Muted);
         m_game->setRole(view.hasRom ? Role::Muted : Role::Faint);
-        m_join->setDashed(!view.mine && !view.hasRom);
-        m_join->setIconName(view.hasPassword && !view.mine && view.hasRom && !full
+        m_join->setDashed(!view.mine && (!view.hasRom || tooFewSeats));
+        m_join->setIconName(view.hasPassword && !view.mine && view.hasRom && !full && !tooFewSeats
             ? QStringLiteral("lock-line") : QString());
-        m_join->setEnabled(view.mine || (view.hasRom && !full));
+        m_join->setEnabled(view.mine || (view.hasRom && !full && !tooFewSeats));
         if (view.mine)
         {
             m_join->setText(tr("Return"));
@@ -1076,6 +1079,13 @@ public:
         {
             m_join->setText(tr("Full"));
             m_join->setToolTip(QString());
+        }
+        else if (tooFewSeats)
+        {
+            m_join->setText(tr("Needs %1 seats").arg(view.seatsNeeded));
+            m_join->setToolTip(freeSeats == 1
+                ? tr("You have %1 players on this PC, and this room has 1 free seat.").arg(view.seatsNeeded)
+                : tr("You have %1 players on this PC, and this room has %2 free seats.").arg(view.seatsNeeded).arg(freeSeats));
         }
         else
         {

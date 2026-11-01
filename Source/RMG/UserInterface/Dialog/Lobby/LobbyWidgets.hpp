@@ -531,7 +531,8 @@ public:
     explicit PortCard(int slot, QWidget* parent = nullptr);
 
     void showOpen(const QString& hint);
-    void showPlayer(const QString& name, bool isSelf, bool isHost);
+    // isSelf: played on this PC. selfTag names how, in place of "You".
+    void showPlayer(const QString& name, bool isSelf, bool isHost, const QString& selfTag = QString());
     void setCountry(const QString& country, const QString& tooltip);
     void setConnection(const QString& connection);
     void setDelay(int frames);

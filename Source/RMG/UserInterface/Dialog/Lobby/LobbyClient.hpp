@@ -99,6 +99,18 @@ public:
         QString localIp;
         int slot = 0;
         bool iceSupported = false;
+        // The user whose connection this seat plays through: userId, unless the
+        // seat is one of several players on a PC. All of a PC's seats share one
+        // ICE peer, so anything about the connection goes by this.
+        quint64 peerId = 0;
+    };
+
+    // Another player on this PC. The lobby treats them as an ordinary user.
+    struct LocalPlayer
+    {
+        quint64 userId = 0;
+        QString name;
+        int controller = 1; // 0-indexed input plugin controller; 0 is the owner's
     };
 
     struct ChatMessage
@@ -132,6 +144,24 @@ public:
     QString selfRegion() const { return m_region; }
     const QHash<quint64, LobbyUser>& users() const { return m_users; }
     const QHash<quint64, LobbyRoomSummary>& rooms() const { return m_rooms; }
+
+    // Local players. They're added and removed in the lobby; the server refuses
+    // both while in a room or searching.
+    bool localPlayersSupported() const { return m_localPlayersSupported; }
+    const QList<LocalPlayer>& localPlayers() const { return m_localPlayers; }
+    // The seats this PC needs: its own, plus one per local player.
+    int seatsOnThisPc() const { return int(m_localPlayers.size()) + 1; }
+    bool isLocalPlayer(quint64 userId) const;
+    // This client's own user, or one of its local players.
+    bool isOnThisPc(quint64 userId) const { return userId == m_selfUserId || isLocalPlayer(userId); }
+    int localPlayerController(quint64 userId) const;
+    void addLocalPlayer(const QString& name, int controller);
+    void removeLocalPlayer(quint64 userId);
+    void setLocalPlayerController(quint64 userId, int controller);
+    // A seat's connection: its peerId, or its user with a server that sends none.
+    static quint64 seatPeerId(const QJsonObject& seat);
+    // One entry per connection in a match roster, for anything talking to peers.
+    static QList<LobbyMatchPeer> connectionPeers(const QList<LobbyMatchPeer>& peers);
 
     // Chat
     void sendChat(const QString& channel, const QString& message);
@@ -319,6 +349,7 @@ signals:
     // peers is the roster after the join, the joiner included.
     void matchAdmitBegin(quint64 matchId, quint64 admitId, int epoch, int seats, quint64 hostId,
                          const LobbyClient::LobbyMatchPeer& joiner,
+                         const QList<LobbyClient::LobbyMatchPeer>& joiners,
                          const QList<LobbyClient::LobbyMatchPeer>& peers);
     void matchAdmitStep(quint64 matchId, quint64 admitId, quint64 fromUserId, const QString& step,
                         int frame, bool ok, const QString& reason);
@@ -328,6 +359,10 @@ signals:
     void matchPeerLeft(quint64 matchId, quint64 userId, int slot, const QString& reason);
 
     void quickMatchStatus(bool searching, int queueSize);
+    void quickMatchRefused(const QString& reason);
+
+    void localPlayersChanged();
+    void localPlayerFailed(const QString& name, const QString& reason);
 
     // Spectate stream (server → spectator). data carries decoded krec bytes.
     void spectateBegan(quint64 matchId, const QByteArray& manifest);
@@ -421,6 +456,9 @@ private:
     void handleMatchAdmitSignal(const QJsonObject& data);
     void handleMatchAdmitFail(const QJsonObject& data);
     void handleQuickMatchStatus(const QJsonObject& data);
+    void handleLocalPlayerAdded(const QJsonObject& data);
+    void handleLocalPlayerRemoved(const QJsonObject& data);
+    void handleLocalPlayerFail(const QJsonObject& data);
     void handleSpectateBegin(const QJsonObject& data);
     void handleSpectateData(const QJsonObject& data);
     void handleSpectateKeyframe(const QJsonObject& data);
@@ -462,6 +500,11 @@ private:
     // Exact host manifest from the successful player sync, reused by live replay.
     QByteArray m_prematchManifest;
     int m_matchSeats = 0;
+
+    bool m_localPlayersSupported = false;
+    QList<LocalPlayer> m_localPlayers;
+    QHash<QString, int> m_pendingLocalControllers; // asked for, by name, until the server answers
+    QHash<quint64, quint64> m_seatPeers;           // seated user -> their connection
     // Chunks of the blob step being received.
     quint64 m_admitBlobId = 0;
     QString m_admitBlobStep;

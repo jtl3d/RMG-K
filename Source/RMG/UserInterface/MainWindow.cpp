@@ -5230,7 +5230,8 @@ void MainWindow::on_Lobby_SessionRequested(QString gameName, QString romFile, QS
     // the highest occupied seat; the player count would drop the top player and
     // shift every label past the gap. Each remotePeers entry is "slot,ip,port",
     // or an option: "seats=N" (a match open to late joiners emulates every
-    // seat) and "join=E" (this client is joining the running match).
+    // seat), "join=E" (this client is joining the running match) and
+    // "local=S:C" (another player on this PC, in seat S on controller C).
     int seatCount = localPlayer;
     bool lateJoiner = false;
     for (const QString& peer : remotePeers)
@@ -5243,6 +5244,11 @@ void MainWindow::on_Lobby_SessionRequested(QString gameName, QString romFile, QS
         if (peer.startsWith(QStringLiteral("join=")))
         {
             lateJoiner = true;
+            continue;
+        }
+        if (peer.startsWith(QStringLiteral("local=")))
+        {
+            seatCount = std::max(seatCount, peer.mid(6).section(':', 0, 0).toInt());
             continue;
         }
         const int slot = peer.section(',', 0, 0).toInt();

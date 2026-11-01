@@ -49,6 +49,22 @@ void CreateRoomDialog::setCoverPath(const QString& coverPath)
         m_tile->setGame(m_romName, coverPath);
 }
 
+void CreateRoomDialog::setMinimumPlayers(int players)
+{
+    m_minimumPlayers = players;
+    for (auto* button : m_playersGroup->buttons())
+    {
+        const bool fits = m_playersGroup->id(button) >= players;
+        button->setEnabled(fits);
+        button->setToolTip(fits ? QString() : tr("You have %1 players on this PC.").arg(players));
+    }
+    if (m_playersGroup->checkedId() < players)
+    {
+        if (auto* button = m_playersGroup->button(players))
+            button->setChecked(true);
+    }
+}
+
 void CreateRoomDialog::buildUi(const QString& defaultUsername, const QString& defaultRoomName)
 {
     auto* root = new QVBoxLayout(this);
@@ -280,6 +296,7 @@ void CreateRoomDialog::showCreateFailure(const QString& reason)
     QString human = reason;
     if (reason == "already_in_room") human = tr("You're already in a room. Leave it first.");
     else if (reason == "invalid_payload") human = tr("Server rejected the room settings.");
+    else if (reason == "not_enough_seats") human = tr("It needs a seat for everyone on this PC.");
     m_statusLabel->setText(QString(tr("Couldn't create room: %1")).arg(human));
 }
 
@@ -287,7 +304,7 @@ void CreateRoomDialog::setFormEnabled(bool enabled)
 {
     m_nameEdit->setEnabled(enabled);
     for (auto* button : m_playersGroup->buttons())
-        button->setEnabled(enabled);
+        button->setEnabled(enabled && m_playersGroup->id(button) >= m_minimumPlayers);
     m_anyoneButton->setEnabled(enabled);
     m_passwordButton->setEnabled(enabled);
     m_liveReplaySwitch->setEnabled(enabled);

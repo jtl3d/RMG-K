@@ -52,6 +52,8 @@ public:
 
     // The selected game's cover art, for the dialog's header tile.
     void setCoverPath(const QString& coverPath);
+    // Rule out rooms too small for everyone on this PC.
+    void setMinimumPlayers(int players);
 
     // Called by the lobby when the server replies ROOM_CREATE_FAIL.
     // Re-enables the form so the user can edit and retry.
@@ -97,6 +99,7 @@ private:
     QString m_romMd5;
     QString m_romRegion;
     int     m_maxPlayers = 2;
+    int     m_minimumPlayers = 2;
     int     m_delay      = 2;
     int     m_prediction = 7;
     QString m_password;
