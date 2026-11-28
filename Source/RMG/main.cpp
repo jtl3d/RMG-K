@@ -18,8 +18,12 @@
 #include <QApplication>
 #include <QFile>
 #include <QDir>
+#include <QHash>
+#include <QMutex>
 #include <QTranslator>
 
+#include <atomic>
+#include <cstring>
 #include <iostream>
 #include <cstdlib>
 
@@ -32,6 +36,7 @@
 #include <signal.h>
 #endif
 
+#include <RMG-Core/Callback.hpp>
 #include <RMG-Core/Directories.hpp>
 #include <RMG-Core/Core.hpp>
 #include <RMG-Core/Error.hpp>
@@ -49,8 +54,63 @@ extern "C"
 #endif
 
 //
+// Local Variables
+//
+
+// Set while the log window takes messages: before it's set up, messages
+// would queue unlocked in RMG-Core.
+static std::atomic<bool> l_ForwardQtMessages = false;
+
+// A warning repeated every frame mustn't flood the log.
+static constexpr int l_MaxQtMessageRepeats = 3;
+static constexpr int l_MaxQtMessages       = 200;
+static QMutex              l_QtMessagesMutex;
+static QHash<QString, int> l_QtMessageRepeats;
+static int                 l_QtMessagesForwarded = 0;
+
+//
 // Local Functions
 //
+
+// Qt explains some failures, such as an OpenGL context it couldn't create,
+// only in its own warnings, which never reached the log window.
+static void forward_qt_message(QtMsgType type, const QMessageLogContext &context, const QString &msg)
+{
+    if ((type != QtWarningMsg && type != QtCriticalMsg) || !l_ForwardQtMessages)
+    {
+        return;
+    }
+
+    bool lastMessage = false;
+    {
+        QMutexLocker locker(&l_QtMessagesMutex);
+        if (l_QtMessagesForwarded >= l_MaxQtMessages)
+        {
+            return;
+        }
+
+        int& repeats = l_QtMessageRepeats[msg];
+        if (repeats >= l_MaxQtMessageRepeats)
+        {
+            return;
+        }
+        repeats++;
+        lastMessage = (++l_QtMessagesForwarded == l_MaxQtMessages);
+    }
+
+    std::string text = "Qt: ";
+    if (context.category != nullptr && std::strcmp(context.category, "default") != 0)
+    {
+        text = std::string("Qt (") + context.category + "): ";
+    }
+    text += msg.toStdString();
+
+    CoreAddCallbackMessage(type == QtCriticalMsg ? CoreDebugMessageType::Error : CoreDebugMessageType::Warning, text);
+    if (lastMessage)
+    {
+        CoreAddCallbackMessage(CoreDebugMessageType::Warning, "Qt: too many messages, further ones are left out of the log");
+    }
+}
 
 static void message_handler(QtMsgType type, const QMessageLogContext &context, const QString &msg)
 {
@@ -64,6 +124,8 @@ static void message_handler(QtMsgType type, const QMessageLogContext &context, c
     }
 
     std::cerr << msg.toStdString() << std::endl;
+
+    forward_qt_message(type, context, msg);
 }
 
 #ifdef _WIN32
@@ -377,6 +439,7 @@ int main(int argc, char **argv)
         if (window.Init(&app, !parser.isSet(noGuiOption), !args.empty() || streamViewer))
         {
             windowInitialized = true;
+            l_ForwardQtMessages = true;
 
             if (!args.empty())
             {
@@ -395,6 +458,7 @@ int main(int argc, char **argv)
             window.show();
 
             exitCode = app.exec();
+            l_ForwardQtMessages = false;
         }
     }
 
