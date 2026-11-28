@@ -125,6 +125,10 @@ if (NETPLAY)
     list(APPEND RMG_SOURCES
         UserInterface/KailleraSessionManager.cpp
         UserInterface/KailleraUIBridge.cpp
+        UserInterface/MainWindowStreamViewer.cpp
+        UserInterface/StreamViewer/StreamViewerProtocol.cpp
+        UserInterface/StreamViewer/StreamViewerHost.cpp
+        UserInterface/StreamViewer/StreamViewerClient.cpp
         UserInterface/Dialog/Kaillera/KailleraNetplayDialog.cpp
         UserInterface/Dialog/Kaillera/KailleraPlaybackDialog.cpp
         UserInterface/Dialog/Kaillera/PlaybackTimeline.cpp
@@ -138,6 +142,7 @@ if (NETPLAY)
         UserInterface/Dialog/Lobby/LobbyBrowsePanels.cpp
         UserInterface/Dialog/Lobby/LobbyPanelLayout.cpp
         UserInterface/Dialog/Lobby/LobbyRoomWindow.cpp
+        UserInterface/Dialog/Lobby/LobbyWatchTracker.cpp
         UserInterface/Dialog/Lobby/LobbySocialWidgets.cpp
         UserInterface/Dialog/Lobby/LobbyChallengeTray.cpp
         UserInterface/Dialog/Lobby/LobbyPrivateChats.cpp
@@ -150,6 +155,7 @@ if (NETPLAY)
         UserInterface/Dialog/Lobby/LagStatsDialog.cpp
         UserInterface/Dialog/Lobby/NetplaySaveDialogs.cpp
         UserInterface/Dialog/Lobby/GameSettingsDialog.cpp
+        UserInterface/Dialog/Lobby/StageListDialog.cpp
         UserInterface/Dialog/Netplay/NetplayCommon.cpp
         UserInterface/Dialog/Netplay/CreateNetplaySessionDialog.cpp
         UserInterface/Dialog/Netplay/CreateNetplaySessionDialog.ui

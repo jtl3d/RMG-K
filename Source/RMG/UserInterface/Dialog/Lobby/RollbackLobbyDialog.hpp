@@ -14,6 +14,7 @@
 #include "LobbyTheme.hpp"
 #include "LagStats.hpp"
 #include "NetplaySaveDialogs.hpp"
+#include "UserInterface/StreamViewer/StreamViewerProtocol.hpp"
 
 #include <QDialog>
 #include <QHash>
@@ -25,6 +26,7 @@
 #include <QByteArray>
 #include <QMutex>
 #include <QPoint>
+#include <QPixmap>
 #include <QVariant>
 
 #include <RMG-Core/RomSettings.hpp>
@@ -50,6 +52,8 @@ class QButtonGroup;
 
 namespace UserInterface
 {
+class StreamViewerHost;
+
 namespace Dialog
 {
 
@@ -85,6 +89,7 @@ class StatusTag;
 class ToggleSwitch;
 class UndoToast;
 class UserAvatar;
+class WatchTracker;
 
 // Top-level rollback lobby UI. Owns a LobbyClient and renders presence /
 // rooms / chat. Modeless — opened from the main window menu.
@@ -121,6 +126,16 @@ public:
     // MainWindow calls this when a spectate playback session ends (emulation
     // stopped) so the server can drop us from the broadcast. Idempotent.
     void stopSpectating();
+
+    // How the main window's live replay is doing and whether it's muted, for
+    // the Watching strip.
+    void setMainStreamState(StreamViewer::State state);
+    void setMainStreamMuted(bool muted);
+
+    // A game of this PC's own is starting (a lobby match, a direct or a
+    // Kaillera session): the viewer windows close, since an emulator running
+    // behind a rollback match costs it frames. Says so in the chat.
+    void ownGameStarting();
 
     // Lag stats for the running rollback match (or the last one), built from
     // our own numbers and the other players' reports. /lagstat in the in-game
@@ -172,6 +187,9 @@ signals:
     // Persistent OSD audience badge. isSpectator selects the role-specific text.
     void liveReplayViewerCountChanged(int viewerCount, bool isSpectator);
     void liveReplayViewerCountCleared();
+    // The Watching strip's main-window entry: its speaker, and a click on it.
+    void mainStreamMuteToggleRequested();
+    void mainStreamWindowRequested();
 
     // Late join notices for the running game: a line in the OSD message
     // stack, the centered banner shown while the game holds for a joiner
@@ -207,6 +225,7 @@ private slots:
     void onCreateRoomClicked();
     void onRoomJoinRequested(quint64 roomId);
     void onMatchWatchRequested(quint64 roomId); // spectate a broadcast match
+    void onMatchWatchInWindowRequested(quint64 roomId); // ...in a viewer window of its own
     void onRoomCreateRequested();
     void onRoomCreated(quint64 roomId);
     void onRoomCreateFailed(const QString& reason);
@@ -431,6 +450,7 @@ private:
     void    appendChatSystemLine(const QString& channel, const QString& text,
                                  const QString& icon = QString(),
                                  LobbyTheme::Role role = LobbyTheme::Role::Muted);
+    QString chatSystemLineHtml(const QString& text, const QString& icon, LobbyTheme::Role role) const;
     // One line of chat. bodyHtml is from chatBodyHtml. mine marks this PC's own
     // lines in a private conversation.
     QString chatMessageHtml(const QString& time, quint64 userId, const QString& who, const QString& bodyHtml,
@@ -518,6 +538,40 @@ private:
     void beginSpectate(quint64 matchId, const QString& gameName, const QString& romMd5);
     void launchSpectate(quint64 matchId, const QString& gameName, const QString& romPath);
     void startPendingSpectate();
+
+    // ── Viewer windows and the Watching strip ──
+    // A watch request for a match. A match already being watched, in the
+    // main window or a window of its own, comes to the front instead.
+    void requestWatch(quint64 roomId, bool newWindow);
+    void openViewerWindow(const LobbyClient::LobbyRoomSummary& room);
+    // A viewer window is gone; failure is why, shown once in the chat.
+    void onViewerWindowClosed(quint64 matchId, const QString& failure);
+    // Closes whichever window shows that match.
+    void stopWatchingMatch(quint64 matchId);
+    void focusStream(quint64 matchId);
+    void refreshWatchTracker();
+    // Who's playing a match, for a stream's name: "Alice vs Bob".
+    QString streamTitle(quint64 matchId) const;
+    // The words for a reason watching failed; the reason itself when it
+    // isn't one this client knows (known says which).
+    QString spectateReasonText(const QString& reason, bool* known = nullptr) const;
+    bool watchingStream(quint64 matchId) const;
+    // The local ROM for a match's game, by MD5, else by name.
+    QString romPathForMatch(const LobbyClient::LobbyRoomSummary& room) const;
+
+    // Spectator chat keeps lines per stream, so the Spectators tab can show
+    // the one picked in the Watching strip and switch without losing any.
+    // The stream the tab shows (a watched match, or this player's own).
+    quint64 chatStream() const;
+    // Shows chatStream()'s lines if the tab shows another's (or anyway, to
+    // reload them).
+    void refreshSpectateChatView(bool reload = false);
+    // Adds a line to a stream's chat, and to the tab when it's shown.
+    void appendSpectateChatLine(quint64 matchId, const QString& html);
+    void appendSpectateSystemLine(quint64 matchId, const QString& text, const QString& icon = QString());
+    void sendSpectatorChatTo(quint64 matchId, const QString& message);
+    // The tab shows while anything has a spectators' chat.
+    void refreshSpectatorChatAvailability();
 
     // Shows the Spectators chat tab (and selects it) while watching a live
     // replay; hiding it returns the column to lobby chat.
@@ -618,12 +672,21 @@ private:
     // pack's, else one of the host's saved sets, savedHint first), after
     // checking them against the ROM. False, with why, when they can't be.
     // remember: the host picked them, so the game's next room starts with them.
-    bool publishGameOptions(const QStringList& ids, QString* error, const QString& savedHint = QString(),
-                            bool remember = true);
+    // lists: the stage lists of the options that take one, which go with
+    // them as each option's param, named when a list is one of the pack's
+    // preset lists or one the host saved.
+    bool publishGameOptions(const QStringList& ids, const QMap<QString, QString>& lists, QString* error,
+                            const QString& savedHint = QString(), bool remember = true);
     // The room's preset is a set its host saved, not one of the packs'.
     bool roomPresetIsHostsSavedSet() const;
     // Whether this PC's ROM for the game takes these options, by the packs' rules too.
-    bool checkGameOptionsOnRom(const QString& romMd5, const QStringList& ids, QString* error) const;
+    bool checkGameOptionsOnRom(const QString& romMd5, const QStringList& ids, const QMap<QString, QString>& lists,
+                               QString* error) const;
+    // The room's stage lists (its options' params), option id -> code.
+    QMap<QString, QString> roomGameOptionLists() const;
+    // Why the room can't take a stage list (a lobby server from before
+    // params), or empty.
+    QString stageListsUnavailable() const;
     // Host: a saved set was made, renamed or deleted; a room using one hears
     // its new name, or that it's custom now.
     void onSavedGameSettingsChanged();
@@ -633,6 +696,22 @@ private:
     // How many options the room can have on: this client's limit, or an older
     // server's.
     int gameOptionsLimit() const;
+    // Players in the room's seats, those on the same PC as another included.
+    int seatedPlayers() const;
+    // What a match with this many players is played with: the room's options,
+    // and what its preset adds for that many (Teams at 4). By id, in pack order.
+    QStringList matchGameOptionIds(int players) const;
+    // The options a match with the players seated now would be played with
+    // that need a blank save, by this client's packs; empty when none do.
+    QStringList blankSaveGameOptions() const;
+    // Host: what the next match starts from, as the room is told: the pick,
+    // or a blank save while blankSaveGameOptions() has any (the pick is kept
+    // for when it doesn't). label: what the room shows for it.
+    CoreNetplaySaveData hostStartingSave(QString* label = nullptr) const;
+    // Host: tells the room again when what it shows isn't what the next match
+    // starts from: game settings or seats changed whether it needs a blank
+    // save, or a match moved the pick on.
+    void syncHostSaveChoice();
     // An option's name in this client's language when its own pack for the
     // game knows the id, else the host's label. Tips add the pack's description.
     QStringList gameOptionLabels(const QString& romMd5, const QList<LobbyClient::LobbyGameOption>& options) const;
@@ -644,8 +723,9 @@ private:
     QString gameOptionsPresetName(const QString& romMd5, const QList<LobbyClient::LobbyGameOption>& options,
                                   const LobbyClient::LobbyGameOption& preset) const;
     // What a room's or match's game settings are called, for a tag or the
-    // Game settings list: the preset, the one option, or "Custom (n)". Empty
-    // with none on.
+    // Game settings list: the preset, the one option, or "Custom (n)", then
+    // each stage list's name or how many stages it has. Hidden options aren't
+    // counted or named (unless only hidden ones are on). Empty with none on.
     QString gameOptionsTag(const QString& romMd5, const QList<LobbyClient::LobbyGameOption>& options,
                            const LobbyClient::LobbyGameOption& preset) const;
     // The preset's name, or the options' names: what a sentence about the
@@ -883,8 +963,9 @@ private:
     ToggleSwitch* m_saveDataKeepCheck = nullptr;   // keep the Save As file updated
 
     // Host-only room option: game settings, under the session switches. The
-    // list holds Default, the packs' presets and Custom; the button opens the
-    // options one by one (Customize for the host, View for everyone else).
+    // list holds Default, the packs' presets, the host's saved sets and, while
+    // the room has one, its custom set; the button opens the options one by
+    // one (Customize for the host, View for everyone else).
     QWidget*             m_gameSettingsRow = nullptr;
     QComboBox*           m_gameSettingsCombo = nullptr;
     LobbyButton*         m_gameSettingsButton = nullptr;
@@ -893,10 +974,13 @@ private:
     // Puts the list back to what the room has when the server ignores a change.
     QTimer*              m_gameOptionsResync = nullptr;
     // The change last sent, while its ROOM_STATE hasn't come: a saved set's
-    // name that doesn't come back was refused. Refused names go as custom
-    // for the rest of the session.
+    // or saved stage list's name that doesn't come back was refused. Refused
+    // names go without a name for the rest of the session.
     QStringList          m_sentGameOptions;
+    QMap<QString, QString> m_sentGameOptionLists;
     LobbyClient::LobbyGameOption m_sentGameOptionsPreset;
+    // The saved stage lists' names in it (label by option id).
+    QMap<QString, QString> m_sentSavedListNames;
     QSet<QString>        m_refusedSavedNames;
     // Holds back a pick from the list until the host stops on one.
     QTimer*              m_gameSettingsPick = nullptr;
@@ -944,6 +1028,23 @@ private:
     // the stale data on the wire — so we drop every keyframe/data message until we
     // see the BEGIN for the current subscribe. Reset false in beginSpectate.
     bool       m_spectateStreamArmed = false;
+
+    // Live replays in windows of their own, each its own process.
+    StreamViewerHost* m_viewerHost = nullptr;
+    WatchTracker*     m_watchTracker = nullptr;
+    StreamViewer::State m_mainStreamState = StreamViewer::State::Connecting;
+    bool       m_mainStreamMuted = false;
+    // The stream picked in the Watching strip for the Spectators chat, and
+    // the viewer window opened or picked last; see chatStream().
+    quint64    m_chatStreamPick = 0;
+    quint64    m_lastViewerStream = 0;
+    quint64    m_chatStreamShown = 0; // whose lines m_chatViewSpectate holds
+    QHash<quint64, QStringList> m_spectateChatLines;
+    // Each watched stream's name, kept after its room leaves the list.
+    QHash<quint64, QString> m_streamTitles;
+    // Every icon put in a chat line, so a stream's lines can be shown again
+    // after the view was cleared (clearing drops a document's images).
+    mutable QHash<QString, QPixmap> m_chatIcons;
 
     // Seat rows (always 4 — slots beyond maxPlayers are hidden)
     SeatRow    m_seats[4];
@@ -1120,22 +1221,17 @@ private:
     QSet<quint64> m_saveDataCapableUsers;
     // Host: what the next match starts from.
     std::optional<NetplaySaveChoice> m_hostSaveChoice;
-    // Host: the game options the room's next match is played with, by id
-    // (CoreGetGameOptions), as the room shows them; empty for none. The match
-    // start resolves them against the ROM and puts them in the manifest.
-    std::vector<std::string> m_hostGameOptionIds;
     // From ROOM_STATE: the room takes game options ("gameOptionsOffered"),
     // up to how many, the ones on for the next match or the running one and
     // the preset they make up, and how many options each seated member's
     // client can play with (members missing can't play with any).
     bool m_roomGameOptionsOffered = false;
     int m_roomGameOptionsMax = CoreGameOptionsLegacyMaxOptions;
+    // The server keeps an option's param (ROOM_STATE gameOptionParams).
+    bool m_roomGameOptionParams = false;
     QList<LobbyClient::LobbyGameOption> m_roomGameOptions;
     LobbyClient::LobbyGameOption m_roomGameOptionsPreset;
     QHash<quint64, int> m_gameOptionsUserMax;
-    // Host: the room hears about a continued save once it's waiting again
-    // (the server takes no save data changes while the match is in game).
-    bool m_publishSaveChoiceWhenWaiting = false;
     // The match's save as every player's game agrees on it. Kept after the
     // match, for Save As, until the next one starts.
     std::optional<CoreNetplaySaveData> m_matchSave;
@@ -1145,6 +1241,12 @@ private:
     QString m_keepCopyFile;            // the Save As file kept updated
     bool m_keepCopyEnabled = false;
     bool m_keepCopyFromPick = false;   // the file is the starting save the host picked
+    // What the kept file holds, as this client last wrote or picked it. A
+    // match only writes to the file when it started from that, or its
+    // progress would be replaced with a fresh start's (the next match on the
+    // host's pick again, or on a blank save for the game settings).
+    std::optional<CoreNetplaySaveData> m_keepCopyHolds;
+    bool m_keepCopyThisMatch = false;
     qint64 m_keepCopyWrittenMs = 0;
     QTimer* m_saveDataTimer = nullptr;
     quint64 m_admitRequestedUserId = 0;   // host clicked Add; no answer yet

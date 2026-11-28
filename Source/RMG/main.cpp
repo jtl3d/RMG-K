@@ -11,14 +11,19 @@
 #include <Utilities/Translation.hpp>
 #if defined(NETPLAY)
 #include <Utilities/KailleraExport/KrecMp4Export.hpp>
+#include <UserInterface/StreamViewer/StreamViewerProtocol.hpp>
 #endif
 
 #include <QCommandLineParser>
 #include <QApplication>
 #include <QFile>
 #include <QDir>
+#include <QHash>
+#include <QMutex>
 #include <QTranslator>
 
+#include <atomic>
+#include <cstring>
 #include <iostream>
 #include <cstdlib>
 
@@ -31,6 +36,7 @@
 #include <signal.h>
 #endif
 
+#include <RMG-Core/Callback.hpp>
 #include <RMG-Core/Directories.hpp>
 #include <RMG-Core/Core.hpp>
 #include <RMG-Core/Error.hpp>
@@ -48,8 +54,63 @@ extern "C"
 #endif
 
 //
+// Local Variables
+//
+
+// Set while the log window takes messages: before it's set up, messages
+// would queue unlocked in RMG-Core.
+static std::atomic<bool> l_ForwardQtMessages = false;
+
+// A warning repeated every frame mustn't flood the log.
+static constexpr int l_MaxQtMessageRepeats = 3;
+static constexpr int l_MaxQtMessages       = 200;
+static QMutex              l_QtMessagesMutex;
+static QHash<QString, int> l_QtMessageRepeats;
+static int                 l_QtMessagesForwarded = 0;
+
+//
 // Local Functions
 //
+
+// Qt explains some failures, such as an OpenGL context it couldn't create,
+// only in its own warnings, which never reached the log window.
+static void forward_qt_message(QtMsgType type, const QMessageLogContext &context, const QString &msg)
+{
+    if ((type != QtWarningMsg && type != QtCriticalMsg) || !l_ForwardQtMessages)
+    {
+        return;
+    }
+
+    bool lastMessage = false;
+    {
+        QMutexLocker locker(&l_QtMessagesMutex);
+        if (l_QtMessagesForwarded >= l_MaxQtMessages)
+        {
+            return;
+        }
+
+        int& repeats = l_QtMessageRepeats[msg];
+        if (repeats >= l_MaxQtMessageRepeats)
+        {
+            return;
+        }
+        repeats++;
+        lastMessage = (++l_QtMessagesForwarded == l_MaxQtMessages);
+    }
+
+    std::string text = "Qt: ";
+    if (context.category != nullptr && std::strcmp(context.category, "default") != 0)
+    {
+        text = std::string("Qt (") + context.category + "): ";
+    }
+    text += msg.toStdString();
+
+    CoreAddCallbackMessage(type == QtCriticalMsg ? CoreDebugMessageType::Error : CoreDebugMessageType::Warning, text);
+    if (lastMessage)
+    {
+        CoreAddCallbackMessage(CoreDebugMessageType::Warning, "Qt: too many messages, further ones are left out of the log");
+    }
+}
 
 static void message_handler(QtMsgType type, const QMessageLogContext &context, const QString &msg)
 {
@@ -63,6 +124,8 @@ static void message_handler(QtMsgType type, const QMessageLogContext &context, c
     }
 
     std::cerr << msg.toStdString() << std::endl;
+
+    forward_qt_message(type, context, msg);
 }
 
 #ifdef _WIN32
@@ -256,6 +319,13 @@ int main(int argc, char **argv)
     exportChatOption.setFlags(QCommandLineOption::HiddenFromHelp);
     exportLabelPortsOption.setFlags(QCommandLineOption::HiddenFromHelp);
     exportVerboseOption.setFlags(QCommandLineOption::HiddenFromHelp);
+#if defined(NETPLAY)
+    // A live replay viewer window, started by the main window's lobby.
+    QCommandLineOption streamViewerOption(StreamViewer::kServerOption, "Internal live replay viewer mode: local server name", "name");
+    QCommandLineOption streamTokenOption(StreamViewer::kTokenOption, "Internal live replay viewer mode: stream token", "token");
+    streamViewerOption.setFlags(QCommandLineOption::HiddenFromHelp);
+    streamTokenOption.setFlags(QCommandLineOption::HiddenFromHelp);
+#endif
 
 #ifndef PORTABLE_INSTALL
     parser.addOption(libPathOption);
@@ -278,6 +348,10 @@ int main(int argc, char **argv)
     parser.addOption(exportChatOption);
     parser.addOption(exportLabelPortsOption);
     parser.addOption(exportVerboseOption);
+#if defined(NETPLAY)
+    parser.addOption(streamViewerOption);
+    parser.addOption(streamTokenOption);
+#endif
     parser.addPositionalArgument("ROM", "ROM to open");
 
     // parse arguments
@@ -317,6 +391,18 @@ int main(int argc, char **argv)
 #endif
     }
 
+#if defined(NETPLAY)
+    const bool streamViewer = parser.isSet(streamViewerOption);
+    if (streamViewer)
+    {
+        // It shares the main window's config and caches, and writes none of
+        // them; set before the core reads (or would write) anything.
+        CoreSetUserFilesReadOnly();
+    }
+#else
+    const bool streamViewer = false;
+#endif
+
     if (!CoreInit())
     {
         std::cerr << "CoreInit() Failed: " << CoreGetError() << std::endl;
@@ -341,10 +427,19 @@ int main(int argc, char **argv)
         CoreAddCallbackMessage(CoreDebugMessageType::Info,
                 "Initializing on " + QGuiApplication::platformName().toStdString());
 
-        // initialize window
-        if (window.Init(&app, !parser.isSet(noGuiOption), !args.empty()))
+#if defined(NETPLAY)
+        if (streamViewer)
+        {
+            window.SetStreamViewer(parser.value(streamViewerOption), parser.value(streamTokenOption).toLatin1());
+            args.clear();
+        }
+#endif
+
+        // initialize window (a viewer window lists no ROMs)
+        if (window.Init(&app, !parser.isSet(noGuiOption), !args.empty() || streamViewer))
         {
             windowInitialized = true;
+            l_ForwardQtMessages = true;
 
             if (!args.empty())
             {
@@ -363,10 +458,12 @@ int main(int argc, char **argv)
             window.show();
 
             exitCode = app.exec();
+            l_ForwardQtMessages = false;
         }
     }
 
-    if (windowInitialized)
+    // A viewer window's settings were never its own to keep.
+    if (windowInitialized && !streamViewer)
     {
         CoreSettingsSave();
     }

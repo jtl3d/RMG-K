@@ -43,8 +43,13 @@
 #include "LobbySocialWidgets.hpp"
 #include "NetplaySaveDialogs.hpp"
 #include "GameSettingsDialog.hpp"
+#include "LobbyWatchTracker.hpp"
+#include "UserInterface/StreamViewer/StreamViewerHost.hpp"
+#include "StageListDialog.hpp"
 
 #include <RMG-Core/Callback.hpp>
+#include <RMG-Core/Emulation.hpp>
+#include <RMG-Core/Volume.hpp>
 #include <RMG-Core/Directories.hpp>
 #include <RMG-Core/Error.hpp>
 #include <RMG-Core/Settings.hpp>
@@ -167,6 +172,8 @@ namespace
     const char* const CHANNEL_ROOM  = "room";
     // Viewers of one live replay; the server never relays it to the players.
     const char* const CHANNEL_SPECTATE = "spectate";
+    // Lines a stream's spectator chat keeps while another's is on screen.
+    constexpr int kSpectateChatKeep = 500;
 
     constexpr int MARGIN_STAGE       = 14;  // around the stage and the sidebar
     constexpr int MARGIN_STAGE_INNER = 8;   // the stage's edge beside the splitter handle
@@ -882,6 +889,10 @@ RollbackLobbyDialog::RollbackLobbyDialog(QWidget* parent)
 
     m_client = new LobbyClient(this);
     m_lagStats = new LagStatsExchange([this](quint64 userId) { return m_client->measuredPingMs(userId); }, this);
+    m_viewerHost = new StreamViewerHost(this);
+    connect(m_viewerHost, &StreamViewerHost::streamsChanged, this, &RollbackLobbyDialog::refreshWatchTracker);
+    connect(m_viewerHost, &StreamViewerHost::streamClosed, this, &RollbackLobbyDialog::onViewerWindowClosed);
+    connect(m_viewerHost, &StreamViewerHost::chatSendRequested, this, &RollbackLobbyDialog::sendSpectatorChatTo);
 
     // Before anything is built: some widgets take their colours once.
     {
@@ -1023,6 +1034,32 @@ QWidget* RollbackLobbyDialog::buildLobbyView()
 
     lay->addWidget(buildMarquee());
     lay->addWidget(new PortStripe(container));
+
+    // Everything being watched, above whatever view is up, so a room's window
+    // can't cover it.
+    m_watchTracker = new WatchTracker(container);
+    connect(m_watchTracker, &WatchTracker::entryClicked, this, [this](quint64 matchId) {
+        // The pick decides the Spectators chat until it closes.
+        m_chatStreamPick = matchId;
+        if (m_viewerHost->has(matchId))
+            m_lastViewerStream = matchId;
+        focusStream(matchId);
+        refreshSpectateChatView();
+    });
+    connect(m_watchTracker, &WatchTracker::muteToggled, this, [this](quint64 matchId, bool muted) {
+        if (matchId == m_spectatingMatchId)
+            emit mainStreamMuteToggleRequested();
+        else
+            m_viewerHost->setMuted(matchId, muted);
+    });
+    connect(m_watchTracker, &WatchTracker::closeClicked, this, &RollbackLobbyDialog::stopWatchingMatch);
+    connect(m_watchTracker, &WatchTracker::closeAllClicked, this, [this]() {
+        for (const auto& stream : m_viewerHost->streams())
+            stopWatchingMatch(stream.matchId);
+        if (m_spectatingMatchId != 0)
+            stopWatchingMatch(m_spectatingMatchId);
+    });
+    lay->addWidget(m_watchTracker);
 
     // The stage, the players and the chat, where the player put them.
     m_panelLayout = new PanelLayout(container);
@@ -1374,8 +1411,16 @@ QWidget* RollbackLobbyDialog::buildBrowseView()
     m_liveGallery = new LiveGallery(this);
     m_liveGallery->setMinimumWidth(276);
     connect(m_liveGallery, &LiveGallery::watchRequested, this, &RollbackLobbyDialog::onMatchWatchRequested);
+    connect(m_liveGallery, &LiveGallery::watchInWindowRequested, this, &RollbackLobbyDialog::onMatchWatchInWindowRequested);
     connect(m_liveGallery, &LiveGallery::joinRequested, this, &RollbackLobbyDialog::onRoomJoinRequested);
-    connect(m_liveGallery, &LiveGallery::stopWatchingRequested, this, [this]() {
+    connect(m_liveGallery, &LiveGallery::stopWatchingRequested, this, [this](quint64 roomId) {
+        const auto room = m_client->rooms().constFind(roomId);
+        const quint64 matchId = room != m_client->rooms().constEnd() ? room->matchId : 0;
+        if (matchId != 0 && m_viewerHost->has(matchId))
+        {
+            stopWatchingMatch(matchId);
+            return;
+        }
         m_pendingSpectate = PendingSpectate{};
         emit spectateStreamClosed(QStringLiteral("stopped"));
     });
@@ -1593,6 +1638,10 @@ QWidget* RollbackLobbyDialog::buildInRoomView()
         if (m_suppressSettingsSignal) return;
         if (m_currentRoomId == 0 || !m_client || m_currentRoomHostId != m_client->selfUserId())
             return;
+        // While the game settings need a blank save there's nothing to pick
+        // yet: the room starts on a blank one, and Change... picks once they don't.
+        if (checked && !m_hostSaveChoice && !blankSaveGameOptions().isEmpty())
+            m_hostSaveChoice = StartingSaveDialog::pickAgain(QStringLiteral("blank"), QString(), false, QString(), QString());
         if (checked && !m_hostSaveChoice && !pickStartingSave())
         {
             m_suppressSettingsSignal = true;
@@ -1786,7 +1835,7 @@ QWidget* RollbackLobbyDialog::buildInRoomView()
     m_saveDataChangeBtn->setObjectName("SaveDataChangeBtn");
     m_saveDataChangeBtn->setButtonSize(LobbyButton::Size::Small);
     m_saveDataChangeBtn->setIconName(QStringLiteral("edit-line"));
-    m_saveDataChangeBtn->setToolTip(tr("Pick another save for the next match to start from."));
+    // Its tip follows the room (updateSaveDataControls).
     connect(m_saveDataChangeBtn, &QPushButton::clicked, this, [this]() {
         if (pickStartingSave())
             publishHostSaveChoice();
@@ -1816,6 +1865,9 @@ QWidget* RollbackLobbyDialog::buildInRoomView()
             m_keepCopyEnabled = checked;
             if (checked && m_matchSave)
                 writeMatchSave(m_keepCopyFile);
+            // Turned on during the match: this match's saves go to the file.
+            if (m_matchSaveActive)
+                m_keepCopyThisMatch = checked;
         }
         updateSaveDataControls();
     });
@@ -2262,15 +2314,18 @@ void RollbackLobbyDialog::refreshChatInput()
 
 void RollbackLobbyDialog::refreshChannelCompose(QLineEdit* input, int tab, bool connected)
 {
-    if (tab == kChatTabSpectators && m_spectatingMatchId == 0)
+    if (tab == kChatTabSpectators && !watchingStream(m_chatStreamShown))
     {
         input->setPlaceholderText(m_playerChatLive ? tr("Message the spectators…") : tr("Closed until your next match"));
         input->setEnabled(connected && m_playerChatLive);
         return;
     }
+    // With several streams open, the box says which one it talks to.
+    const int streams = (m_spectatingMatchId != 0 ? 1 : 0) + m_viewerHost->count() + (m_playerChatLive ? 1 : 0);
     input->setPlaceholderText(tab == kChatTabSpectators
-            ? (m_client && m_client->spectatorChatSupported() ? tr("Message the spectators and players…")
-                                                              : tr("Message the other spectators…"))
+            ? (streams > 1 ? tr("Message the viewers of %1…").arg(m_streamTitles.value(m_chatStreamShown))
+               : m_client && m_client->spectatorChatSupported() ? tr("Message the spectators and players…")
+                                                                : tr("Message the other spectators…"))
         : tab == kChatTabRoom ? tr("Message the room…")
                               : tr("Message the lobby…"));
     input->setEnabled(connected);
@@ -3229,11 +3284,16 @@ void RollbackLobbyDialog::onClientStateChanged(LobbyClient::ConnectionState s)
         m_pendingSpectate = PendingSpectate{};
         if (m_spectatingMatchId != 0)
         {
+            m_spectateChatLines.remove(m_spectatingMatchId);
+            m_streamTitles.remove(m_spectatingMatchId);
             m_spectatingMatchId = 0;
             m_spectateStreamArmed = false;
-            setSpectatorChatVisible(false);
+            refreshSpectatorChatAvailability();
             emit spectateStreamClosed(QStringLiteral("disconnected"));
         }
+        // The viewer windows' streams come over this connection too.
+        m_viewerHost->closeAll();
+        refreshWatchTracker();
         clearPlayerRows();
         m_quickMatchActive = false;
         // The client dropped its side of a ping check with the connection.
@@ -4025,8 +4085,9 @@ void RollbackLobbyDialog::onRoomListChanged()
             match.seatsNeeded = m_client->seatsOnThisPc();
             match.hasRom = hasRom;
             match.sameGame = sameGame;
-            match.watching = m_spectatingMatchId != 0 && m_spectatingMatchId == r.matchId;
-            match.watchingOther = m_spectatingMatchId != 0 && !match.watching;
+            match.watchingInWindow = r.matchId != 0 && m_viewerHost->has(r.matchId);
+            match.watching = (m_spectatingMatchId != 0 && m_spectatingMatchId == r.matchId) || match.watchingInWindow;
+            match.watchingOther = m_spectatingMatchId != 0 && m_spectatingMatchId != r.matchId;
             match.inRoom = m_currentRoomId != 0;
             for (const QString& name : r.playerNames)
                 match.players.append({ name, countries.value(name), connections.value(name) });
@@ -4243,22 +4304,58 @@ void RollbackLobbyDialog::clearServerRoomSnapshot()
 
 void RollbackLobbyDialog::showAdminRoomMenu(quint64 roomId, const QPoint& globalPos)
 {
-    // Right-click close is a moderator tool — everyone else gets no menu.
-    if (!m_client || !m_client->isModerator() || roomId == 0)
+    // A live match can be watched from its menu, here or in a window of its
+    // own. Closing a room is a moderator tool.
+    if (!m_client || roomId == 0)
         return;
     const auto room = m_client->rooms().constFind(roomId);
     if (room == m_client->rooms().constEnd())
         return;
+    const bool moderator = m_client->isModerator();
+    const bool live = room->state == QLatin1String("in_game") && room->broadcasting && room->matchId != 0;
+    if (!moderator && !live)
+        return;
+    // Copies: the menu runs an event loop, and a room list arriving under it
+    // replaces the client's rooms.
+    const QString roomName = room->name;
+    const bool inGame = room->state == QLatin1String("in_game");
+    const bool hasRom = !romPathForMatch(room.value()).isEmpty();
+    const bool watched = live && watchingStream(room->matchId);
 
     LobbyMenu menu(this);
-    QAction* closeAction = menu.addDangerItem(QStringLiteral("close-circle-line"), room->state == QLatin1String("in_game")
-        ? tr("End match && close room  (moderator)")
-        : tr("Close room  (moderator)"));
-    if (menu.exec(globalPos) != closeAction)
+    QAction* watchAction = nullptr;
+    QAction* windowAction = nullptr;
+    if (live && hasRom)
+    {
+        watchAction = menu.addItem(QStringLiteral("eye-line"), watched ? tr("Bring to Front") : tr("Watch"));
+        windowAction = menu.addItem(QStringLiteral("external-link-line"), tr("Watch in New Window"));
+    }
+    else if (live)
+    {
+        menu.addDisabledItem(QStringLiteral("eye-line"), tr("Watch"), tr("No ROM"));
+    }
+    QAction* closeAction = nullptr;
+    if (moderator)
+    {
+        if (live)
+            menu.addSeparator();
+        closeAction = menu.addDangerItem(QStringLiteral("close-circle-line"), inGame
+            ? tr("End match && close room  (moderator)")
+            : tr("Close room  (moderator)"));
+    }
+    QAction* chosen = menu.exec(globalPos);
+    if (chosen == nullptr)
+        return;
+    if (chosen == watchAction || chosen == windowAction)
+    {
+        requestWatch(roomId, chosen == windowAction);
+        return;
+    }
+    if (chosen != closeAction)
         return;
 
     if (QMessageBox::question(this, tr("Close room"),
-            tr("Close \"%1\" for everyone?").arg(room->name)) != QMessageBox::Yes)
+            tr("Close \"%1\" for everyone?").arg(roomName)) != QMessageBox::Yes)
         return;
 
     m_client->sendModAction(QStringLiteral("closeroom"),
@@ -4298,9 +4395,11 @@ void RollbackLobbyDialog::onCreateRoomClicked()
         m_username, m_lastRoomName, romName, romMd5, this);
     m_createRoomDialog->setCoverPath(coverPathForMd5(romMd5));
     m_createRoomDialog->setMinimumPlayers(m_client->seatsOnThisPc());
-    m_createRoomDialog->setGameOptionsCheck([this, romMd5](const QStringList& ids, QString& error) {
-        return checkGameOptionsOnRom(romMd5, ids, &error);
-    });
+    m_createRoomDialog->setGameOptionsCheck(
+        [this, romMd5](const QStringList& ids, const QMap<QString, QString>& lists, QString& error) {
+            return checkGameOptionsOnRom(romMd5, ids, lists, &error);
+        });
+    m_createRoomDialog->setRomPath(localRomPathForMd5(romMd5));
     connect(m_createRoomDialog, &CreateRoomDialog::createRequested,
             this, &RollbackLobbyDialog::onRoomCreateRequested);
     connect(m_createRoomDialog, &QDialog::finished, this, [this](int) {
@@ -4505,7 +4604,7 @@ void RollbackLobbyDialog::onRoomJoinRequested(quint64 roomId)
     {
         if (summary.broadcasting && summary.matchId != 0)
         {
-            beginSpectate(summary.matchId, summary.romName, summary.romMd5);
+            requestWatch(roomId, false);
         }
         else
         {
@@ -4632,14 +4731,32 @@ void RollbackLobbyDialog::onPingCheckFinished(quint64 roomId, int pingMs, bool m
 
 void RollbackLobbyDialog::onMatchWatchRequested(quint64 roomId)
 {
+    requestWatch(roomId, false);
+}
+
+void RollbackLobbyDialog::onMatchWatchInWindowRequested(quint64 roomId)
+{
+    requestWatch(roomId, true);
+}
+
+void RollbackLobbyDialog::requestWatch(quint64 roomId, bool newWindow)
+{
     if (m_client->state() != LobbyClient::ConnectionState::Connected) return;
-    if (m_currentRoomId != 0)
+    const auto room = m_client->rooms().constFind(roomId);
+    if (room != m_client->rooms().constEnd() && room->matchId != 0 && watchingStream(room->matchId))
+    {
+        // Watched already, here or in a window of its own: that comes forward.
+        focusStream(room->matchId);
+        return;
+    }
+    // A window of its own watches beside a room or a game; the main window
+    // keeps its rules.
+    if (!newWindow && m_currentRoomId != 0)
     {
         QMessageBox::information(this, tr("In a room"),
             tr("Leave your room before watching a match."));
         return;
     }
-    const auto room = m_client->rooms().constFind(roomId);
     if (room == m_client->rooms().constEnd())
         return;
     if (!room->broadcasting || room->matchId == 0)
@@ -4648,7 +4765,10 @@ void RollbackLobbyDialog::onMatchWatchRequested(quint64 roomId)
             tr("That match isn't streaming a live replay, so there's nothing to watch."));
         return;
     }
-    beginSpectate(room->matchId, room->romName, room->romMd5);
+    if (newWindow)
+        openViewerWindow(room.value());
+    else
+        beginSpectate(room->matchId, room->romName, room->romMd5);
 }
 
 void RollbackLobbyDialog::onRoomCreateFailed(const QString& reason)
@@ -4702,6 +4822,83 @@ namespace
         for (const auto& option : options)
             ids << option.id;
         return ids;
+    }
+
+    QMap<QString, QString> gameOptionLists(const QList<LobbyClient::LobbyGameOption>& options)
+    {
+        QMap<QString, QString> lists;
+        for (const auto& option : options)
+        {
+            if (!option.param.isEmpty())
+                lists.insert(option.id, option.param);
+        }
+        return lists;
+    }
+
+    // A room option's stage list as this client's pack reads it, or none.
+    std::vector<CoreStageListEntry> roomStageList(const QString& romMd5, const LobbyClient::LobbyGameOption& option,
+                                                  CoreStageListInfo& info)
+    {
+        if (option.param.isEmpty() || !CoreGetStageList(romMd5.toStdString(), option.id.toStdString(),
+                                                        GameSettingsCatalog::language(), info))
+            return {};
+        return stageListEntries(info, option.param);
+    }
+
+    // "12 stages on 1 page: Dream Land, Battlefield, ... and 8 more", or empty.
+    QString stageListLine(const QString& romMd5, const LobbyClient::LobbyGameOption& option)
+    {
+        CoreStageListInfo info;
+        const std::vector<CoreStageListEntry> entries = roomStageList(romMd5, option, info);
+        if (entries.empty())
+            return QString();
+        QStringList names;
+        for (size_t i = 0; i < entries.size() && i < 5; i++)
+        {
+            if (const CoreStageListStage* s = info.stage(entries[i].Stage))
+                names << QString::fromStdString(s->Name);
+        }
+        if (entries.size() > 5)
+            names << RollbackLobbyDialog::tr("and %n more", nullptr, int(entries.size()) - 5);
+        return QStringLiteral("%1: %2").arg(stageListCountText(info, int(entries.size())), names.join(QStringLiteral(", ")));
+    }
+
+    // A room option's stage list's name, in this client's language when it's
+    // one of its pack's preset lists: the room's word for it, else this
+    // client's preset list with the same stages (a host without names), else
+    // empty.
+    QString roomStageListName(const QString& romMd5, const LobbyClient::LobbyGameOption& option)
+    {
+        CoreStageListInfo info;
+        const std::vector<CoreStageListEntry> entries = roomStageList(romMd5, option, info);
+        if (!option.paramPresetId.isEmpty())
+        {
+            const CoreStageListPreset* own = SavedGameSettings::isPresetId(option.paramPresetId)
+                ? nullptr : info.preset(option.paramPresetId.toStdString());
+            return own ? QString::fromStdString(own->Label) : option.paramPresetLabel;
+        }
+        for (const CoreStageListPreset& preset : info.Presets)
+        {
+            if (!entries.empty() && preset.Stages == entries)
+                return QString::fromStdString(preset.Label);
+        }
+        return QString();
+    }
+
+    // The room's options this client's packs don't hide: what's counted and
+    // named. When only hidden ones are on, those, so the room doesn't pass
+    // for the unchanged game.
+    QList<LobbyClient::LobbyGameOption> shownGameOptions(const QString& romMd5,
+                                                         const QList<LobbyClient::LobbyGameOption>& options)
+    {
+        const GameSettingsCatalog catalog = GameSettingsCatalog::forRom(romMd5);
+        QList<LobbyClient::LobbyGameOption> shown;
+        for (const auto& option : options)
+        {
+            if (!catalog.isHidden(option.id))
+                shown << option;
+        }
+        return shown.isEmpty() ? options : shown;
     }
 }
 
@@ -4792,14 +4989,9 @@ void RollbackLobbyDialog::onRoomStateChanged(const QJsonObject& roomState)
     m_roomGameOptionsMax = roomState.contains("gameOptionsMax")
         ? std::clamp(roomState.value("gameOptionsMax").toInt(), 1, CoreGameOptionsMaxOptions)
         : CoreGameOptionsLegacyMaxOptions;
+    m_roomGameOptionParams = roomState.value("gameOptionParams").toBool();
     m_roomGameOptions = LobbyClient::parseGameOptions(roomState.value("gameOptions"));
     m_roomGameOptionsPreset = LobbyClient::parseGameOptionsPreset(roomState.value("gameOptionsPreset"));
-    m_hostGameOptionIds.clear();
-    if (iAmHost)
-    {
-        for (const auto& option : std::as_const(m_roomGameOptions))
-            m_hostGameOptionIds.push_back(option.id.toStdString());
-    }
     // Join limits are the host's too, and can change at any time.
     m_roomHasJoinLimits = roomState.contains("joinLimits");
     {
@@ -4816,13 +5008,6 @@ void RollbackLobbyDialog::onRoomStateChanged(const QJsonObject& roomState)
     {
         m_createdRoomRestored = true;
         restoreRoomChoices();
-    }
-
-    if (m_publishSaveChoiceWhenWaiting && iAmHost && state == "waiting")
-    {
-        m_publishSaveChoiceWhenWaiting = false;
-        if (m_roomSaveDataEnabled)
-            publishHostSaveChoice();
     }
 
     // Pacing is host-authoritative and applies to every seat. Mirror it into the
@@ -5100,6 +5285,10 @@ void RollbackLobbyDialog::onRoomStateChanged(const QJsonObject& roomState)
         m_roomSeatsSeen = true;
     }
 
+    // The game settings, the seats or the last match may have changed what the
+    // next match starts from; the room shows it once it's waiting.
+    syncHostSaveChoice();
+
     // Start button gating (host-only): waiting, 2+ seated, every pair measured.
     // Re-resolve local Auto after seat changes too: a join/leave can change this
     // player's worst relevant path even before another probe result arrives.
@@ -5117,8 +5306,14 @@ void RollbackLobbyDialog::rememberRoomChoices(const QVariantMap& choices)
         return;
     QSettings s("RMG-K", "n02");
     s.beginGroup(CreateRoomDialog::romSettingsGroup(m_createdRoomMd5));
+    // An empty value drops a choice this version no longer has.
     for (auto it = choices.cbegin(); it != choices.cend(); ++it)
-        s.setValue(it.key(), it.value());
+    {
+        if (it.value().isValid())
+            s.setValue(it.key(), it.value());
+        else
+            s.remove(it.key());
+    }
     s.endGroup();
 }
 
@@ -5134,10 +5329,11 @@ void RollbackLobbyDialog::restoreRoomChoices()
     if (m_roomHasLateJoinOption && !m_roomLateJoinEnabled && s.value("LateJoin", false).toBool())
         m_client->updateRoomLateJoin(true);
 
+    // A "SaveContinue" left by an older version is ignored: the picks say
+    // themselves whether matches carry on from one another.
     if (m_roomHasSaveDataOption && !m_roomSaveDataEnabled && s.value("SaveData", false).toBool())
     {
         m_hostSaveChoice = StartingSaveDialog::pickAgain(s.value("SaveSource").toString(), s.value("SaveFile").toString(),
-                                                         s.value("SaveContinue", true).toBool(),
                                                          s.value("SaveKeepFile", false).toBool(),
                                                          romFile, m_currentRoomMd5);
         if (m_hostSaveChoice)
@@ -5147,6 +5343,7 @@ void RollbackLobbyDialog::restoreRoomChoices()
                 m_keepCopyFile = m_hostSaveChoice->File;
                 m_keepCopyEnabled = true;
                 m_keepCopyFromPick = true;
+                m_keepCopyHolds = m_hostSaveChoice->Data;
             }
             publishHostSaveChoice();
         }
@@ -5160,7 +5357,7 @@ void RollbackLobbyDialog::restoreRoomChoices()
     const GameSettingsChoice gameSettings = catalog.rememberedChoice(s, catalog.savedSets(m_currentRoomMd5));
     s.endGroup();
     if (m_roomGameOptionsOffered && m_roomGameOptions.isEmpty() && !gameSettings.Options.isEmpty())
-        publishGameOptions(gameSettings.Options, nullptr,
+        publishGameOptions(gameSettings.Options, gameSettings.Lists, nullptr,
                            gameSettings.Type == GameSettingsChoice::Kind::Saved ? gameSettings.Id : QString());
 }
 
@@ -5356,6 +5553,14 @@ void RollbackLobbyDialog::updateSaveDataControls()
     const QString unsavedHtml = !iAmHost ? unsavedText
         : QStringLiteral("<span style='color:%1; font-weight:600;'>%2</span>").arg(LobbyTheme::tokens().warn.name(), unsavedText);
 
+    // Game settings that need a blank save: the host's client starts the
+    // match from one, whatever was picked. Anyone else says so only when the
+    // room's save is blank, as the host's client then made it.
+    const QStringList blankFor = m_roomSaveDataEnabled ? blankSaveGameOptions() : QStringList();
+    const bool locked = !blankFor.isEmpty() && (iAmHost || m_roomSaveDataKinds.isEmpty());
+    const QString settingsName = gameOptionsTag(m_currentRoomMd5, m_roomGameOptions, m_roomGameOptionsPreset);
+    const QString lockedText = tr("%1 needs a blank save").arg(settingsName).toHtmlEscaped();
+
     QStringList parts;
     // The host's label is in the host's language; a blank save reads in ours.
     const QString label = m_roomSaveDataEnabled && m_roomSaveDataKinds.isEmpty() ? tr("Blank save")
@@ -5373,9 +5578,16 @@ void RollbackLobbyDialog::updateSaveDataControls()
         parts << tr("<b>Save data:</b> the last match changed the save");
         if (unsavedChange)
             parts << unsavedHtml;
+        // What the next match starts from, as the pick says: only where the
+        // last match left off and a kept file carry on.
         if (iAmHost && m_hostSaveChoice && m_roomSaveDataEnabled)
-            parts << (m_hostSaveChoice->ContinueAfterMatch ? tr("the next match continues from it")
-                                                           : tr("the next match starts from %1 again").arg(label.toHtmlEscaped()));
+        {
+            const bool carriesOn = m_hostSaveChoice->FromLastMatch ||
+                (m_hostSaveChoice->KeepFileUpdated && m_keepCopyEnabled && m_keepCopyFromPick);
+            parts << (locked ? lockedText
+                      : carriesOn ? tr("the next match continues from it")
+                                  : tr("the next match starts from %1 again").arg(label.toHtmlEscaped()));
+        }
     }
     else
     {
@@ -5383,18 +5595,28 @@ void RollbackLobbyDialog::updateSaveDataControls()
         if (!m_roomSaveDataKinds.isEmpty())
             parts << QStringLiteral("%1 · %2").arg(m_roomSaveDataKinds.join(QStringLiteral(" + ")),
                                                    tr("%1 KB").arg((m_roomSaveDataBytes + 1023) / 1024));
-        if (!iAmHost)
+        if (locked)
+            parts << lockedText;
+        else if (!iAmHost)
             parts << tr("picked by the host");
     }
     if (m_keepCopyEnabled && !m_keepCopyFile.isEmpty())
     {
         const QString name = QFileInfo(m_keepCopyFile).completeBaseName().toHtmlEscaped();
-        parts << (m_keepCopyWrittenMs > 0 ? tr("kept in %1 (%2)").arg(name, ago(m_keepCopyWrittenMs))
-                                          : tr("kept in %1").arg(name));
+        if (m_matchSaveActive && !m_keepCopyThisMatch)
+            parts << tr("%1 isn't updated: this match didn't start from it").arg(name);
+        else
+            parts << (m_keepCopyWrittenMs > 0 ? tr("kept in %1 (%2)").arg(name, ago(m_keepCopyWrittenMs))
+                                              : tr("kept in %1").arg(name));
     }
     m_saveDataNote->setText(parts.join(QStringLiteral(" · ")));
 
     m_saveDataChangeBtn->setVisible(iAmHost && editable && m_roomSaveDataEnabled);
+    m_saveDataChangeBtn->setEnabled(!locked);
+    m_saveDataChangeBtn->setToolTip(!locked
+        ? tr("Pick another save for the next match to start from, or where the last match left off.")
+        : tr("Matches start from a blank save while %1 is on (%2).\nThe save you picked comes back when it's off.")
+              .arg(settingsName, GameSettingsCatalog::forRom(m_currentRoomMd5).labels(blankFor).join(QStringLiteral(", "))));
     m_saveDataSaveAsBtn->setVisible(m_matchSave.has_value() && (m_matchSaveActive || m_matchSaveChanged));
     m_saveDataKeepCheck->setVisible(m_matchSave.has_value() && m_matchSaveActive);
     {
@@ -5408,9 +5630,13 @@ void RollbackLobbyDialog::updateSaveDataControls()
 
 bool RollbackLobbyDialog::pickStartingSave()
 {
+    // Nothing to pick while the game settings need a blank save.
+    if (!blankSaveGameOptions().isEmpty())
+        return false;
     const QString romFile = localRomPathForMd5(m_currentRoomMd5);
+    // How this room's last match with save data ended, changed or not.
     std::optional<CoreNetplaySaveData> lastMatch;
-    if (m_matchSaveChanged && m_matchSave)
+    if (m_matchSave && !m_matchSaveActive)
         lastMatch = m_matchSave;
 
     StartingSaveDialog dialog(romFile, m_currentRoomMd5, m_currentRoomGame, m_hostSaveChoice, lastMatch, this);
@@ -5423,38 +5649,70 @@ bool RollbackLobbyDialog::pickStartingSave()
         return false;
 
     m_hostSaveChoice = dialog.choice();
-    rememberRoomChoices({ { QStringLiteral("SaveData"), true },
-                          { QStringLiteral("SaveSource"), dialog.source() },
-                          { QStringLiteral("SaveFile"), m_hostSaveChoice->File },
-                          { QStringLiteral("SaveContinue"), m_hostSaveChoice->ContinueAfterMatch },
-                          { QStringLiteral("SaveKeepFile"), m_hostSaveChoice->KeepFileUpdated } });
+    // The next room made for the game starts from the same pick, read again.
+    // It has no last match, so picking that one leaves the earlier pick
+    // remembered. Continue was a switch of its own before; it's dropped.
+    QVariantMap remembered = { { QStringLiteral("SaveData"), true },
+                               { QStringLiteral("SaveContinue"), QVariant() } };
+    if (!m_hostSaveChoice->FromLastMatch)
+    {
+        remembered.insert(QStringLiteral("SaveSource"), m_hostSaveChoice->Source);
+        remembered.insert(QStringLiteral("SaveFile"), m_hostSaveChoice->File);
+        remembered.insert(QStringLiteral("SaveKeepFile"), m_hostSaveChoice->KeepFileUpdated);
+    }
+    rememberRoomChoices(remembered);
     // A kept netplay save is played on: the game's saves go back into it.
     if (m_hostSaveChoice->KeepFileUpdated)
     {
         m_keepCopyFile = m_hostSaveChoice->File;
         m_keepCopyEnabled = true;
         m_keepCopyFromPick = true;
+        m_keepCopyHolds = m_hostSaveChoice->Data;
     }
-    else if (m_keepCopyFromPick &&
-             !(lastMatch && m_hostSaveChoice->File.isEmpty() && m_hostSaveChoice->Data == *lastMatch))
+    else if (m_keepCopyFromPick && !m_hostSaveChoice->FromLastMatch)
     {
         // Another save was picked: its progress doesn't belong in that file.
         // (Picking where the last match left off carries on in the same file.)
         m_keepCopyFile.clear();
         m_keepCopyEnabled = false;
         m_keepCopyFromPick = false;
+        m_keepCopyHolds.reset();
     }
     updateSaveDataControls();
     return true;
+}
+
+CoreNetplaySaveData RollbackLobbyDialog::hostStartingSave(QString* label) const
+{
+    if (!m_hostSaveChoice || !blankSaveGameOptions().isEmpty())
+    {
+        if (label)
+            *label = tr("Blank save");
+        return {};
+    }
+    if (label)
+        *label = m_hostSaveChoice->Label;
+    return m_hostSaveChoice->Data;
 }
 
 void RollbackLobbyDialog::publishHostSaveChoice()
 {
     if (!m_client || !m_hostSaveChoice)
         return;
-    const CoreNetplaySaveData& data = m_hostSaveChoice->Data;
-    m_client->updateRoomSaveData(true, m_hostSaveChoice->Label, netplaySaveKindLabels(data),
-                                 int(data.TotalBytes()), netplaySaveHash(data));
+    QString label;
+    const CoreNetplaySaveData data = hostStartingSave(&label);
+    m_client->updateRoomSaveData(true, label, netplaySaveKindLabels(data), int(data.TotalBytes()), netplaySaveHash(data));
+}
+
+void RollbackLobbyDialog::syncHostSaveChoice()
+{
+    // The server takes save data changes only while the room waits; the next
+    // ROOM_STATE that says so gets here again.
+    const bool iAmHost = m_client && m_currentRoomId != 0 && m_currentRoomHostId == m_client->selfUserId();
+    if (!iAmHost || m_currentRoomState != QLatin1String("waiting") || !m_roomSaveDataEnabled || !m_hostSaveChoice)
+        return;
+    if (netplaySaveHash(hostStartingSave()) != m_roomSaveDataHash)
+        publishHostSaveChoice();
 }
 
 void RollbackLobbyDialog::beginMatchSave()
@@ -5471,6 +5729,13 @@ void RollbackLobbyDialog::beginMatchSave()
     m_matchSaveChanged = false;
     m_matchSaveChangedMs = 0;
     m_keepCopyWrittenMs = 0;
+    // A kept file goes on from where it is only with a match that starts
+    // there too.
+    m_keepCopyThisMatch = m_keepCopyEnabled && !m_keepCopyFile.isEmpty() && m_keepCopyHolds &&
+        *m_keepCopyHolds == *m_matchSave;
+    if (m_keepCopyEnabled && !m_keepCopyThisMatch)
+        CoreAddCallbackMessage(CoreDebugMessageType::Info,
+            "Save data: this match didn't start from the kept file's save, so it isn't written to it");
     if (!m_saveDataTimer)
     {
         m_saveDataTimer = new QTimer(this);
@@ -5490,7 +5755,7 @@ void RollbackLobbyDialog::onSaveDataTick()
         m_matchSave = std::move(data);
         m_matchSaveChanged = true;
         m_matchSaveChangedMs = QDateTime::currentMSecsSinceEpoch();
-        if (m_keepCopyEnabled && !m_keepCopyFile.isEmpty())
+        if (m_keepCopyEnabled && m_keepCopyThisMatch && !m_keepCopyFile.isEmpty())
         {
             QString error;
             if (!writeMatchSave(m_keepCopyFile, &error))
@@ -5517,32 +5782,32 @@ void RollbackLobbyDialog::finishMatchSave()
 
     const bool iAmHost = m_client && m_currentRoomId != 0 &&
         m_currentRoomHostId == m_client->selfUserId();
+    const bool kept = m_keepCopyEnabled && m_keepCopyThisMatch && !m_keepCopyFile.isEmpty();
     if (m_matchSaveChanged && m_matchSave)
     {
-        if (m_keepCopyEnabled && !m_keepCopyFile.isEmpty())
+        if (kept)
             appendChatSystemLine(CHANNEL_ROOM, tr("The game's save is kept in %1.")
                 .arg(QDir::toNativeSeparators(m_keepCopyFile)));
         else
             appendChatSystemLine(CHANNEL_ROOM, tr("The game saved during this match. Use Save As to keep a copy."));
+    }
 
-        // The next match picks up where this one left off.
-        if (iAmHost && m_hostSaveChoice && m_hostSaveChoice->ContinueAfterMatch && m_roomSaveDataEnabled)
+    // Only two picks move on with the match: where the last match left off,
+    // and a kept file this match wrote to. Every other pick starts the next
+    // match from the same save again.
+    if (iAmHost && m_hostSaveChoice && m_matchSave && m_roomSaveDataEnabled)
+    {
+        const bool fileMovedOn = m_hostSaveChoice->KeepFileUpdated && kept && m_keepCopyFromPick &&
+            m_keepCopyFile == m_hostSaveChoice->File;
+        if (m_hostSaveChoice->FromLastMatch || fileMovedOn)
         {
-            QString label = m_hostSaveChoice->Label;
-            const QString suffix = tr(" (continued)");
-            if (!label.endsWith(suffix))
-                label += suffix;
             m_hostSaveChoice->Data = *m_matchSave;
-            m_hostSaveChoice->Label = label;
-            m_hostSaveChoice->File.clear();
-            // The room may already be waiting again: our game can close after
-            // the server's ROOM_STATE says so.
-            if (m_currentRoomState == "waiting")
-                publishHostSaveChoice();
-            else
-                m_publishSaveChoiceWhenWaiting = true;
+            // The room may already be waiting again (our game can close after
+            // the server's ROOM_STATE says so); otherwise that ROOM_STATE syncs it.
+            syncHostSaveChoice();
         }
     }
+    m_keepCopyThisMatch = false;
     updateSaveDataControls();
 }
 
@@ -5565,8 +5830,11 @@ void RollbackLobbyDialog::saveMatchSaveAs()
     }
     m_keepCopyFile = file;
     m_keepCopyFromPick = false;
-    // Between matches too: the next match in this room then updates the file.
+    // Between matches too: the next match in this room then updates the file,
+    // when it starts where this one left off.
     m_keepCopyEnabled = dialog.keepUpdated();
+    if (m_matchSaveActive)
+        m_keepCopyThisMatch = m_keepCopyEnabled;
     appendChatSystemLine(CHANNEL_ROOM, m_keepCopyEnabled
         ? tr("Saved to %1. It's kept updated while you play.").arg(QDir::toNativeSeparators(file))
         : tr("Saved to %1.").arg(QDir::toNativeSeparators(file)));
@@ -5595,6 +5863,8 @@ bool RollbackLobbyDialog::writeMatchSave(const QString& file, QString* error)
         return false;
     }
     m_keepCopyWrittenMs = QDateTime::currentMSecsSinceEpoch();
+    // Every write goes to the file kept, or to the one Save As keeps next.
+    m_keepCopyHolds = m_matchSave;
     return true;
 }
 
@@ -5631,7 +5901,7 @@ QString RollbackLobbyDialog::gameOptionsTip(const QString& romMd5,
     {
         const GameSettingsCatalog catalog = GameSettingsCatalog::forRom(romMd5);
         const CoreGameOptionPresetInfo* own = !preset.id.isEmpty() ? catalog.preset(preset.id)
-                                                                   : catalog.presetFor(gameOptionIds(options));
+                                                                   : catalog.presetFor(gameOptionIds(options), gameOptionLists(options));
         if (own && !own->Description.empty())
             lines << QStringLiteral("%1: %2").arg(presetName, QString::fromStdString(own->Description));
         else if (!own && SavedGameSettings::isPresetId(preset.id))
@@ -5639,15 +5909,24 @@ QString RollbackLobbyDialog::gameOptionsTip(const QString& romMd5,
         else
             lines << presetName;
     }
-    else if (options.size() > 1)
+    const QList<LobbyClient::LobbyGameOption> shown = shownGameOptions(romMd5, options);
+    if (presetName.isEmpty() && shown.size() > 1)
     {
         lines << tr("Custom game settings:");
     }
-    for (const auto& option : options)
+    for (const auto& option : shown)
     {
         const std::optional<CoreGameOptionInfo> own = ownGameOption(romMd5, option.id);
         QString line;
-        if (own && !own->Description.empty())
+        // A stage list says its name and what's on it rather than what the
+        // option is.
+        const QString stages = stageListLine(romMd5, option);
+        const QString listName = roomStageListName(romMd5, option);
+        if (own && !stages.isEmpty() && !listName.isEmpty())
+            line = tr("%1: %2 (%3)", "stage list option: list name (stages)").arg(QString::fromStdString(own->Label), listName, stages);
+        else if (own && !stages.isEmpty())
+            line = QStringLiteral("%1: %2").arg(QString::fromStdString(own->Label), stages);
+        else if (own && !own->Description.empty())
             line = QStringLiteral("%1: %2").arg(QString::fromStdString(own->Label), QString::fromStdString(own->Description));
         else
             line = own ? QString::fromStdString(own->Label) : option.label;
@@ -5668,7 +5947,7 @@ QString RollbackLobbyDialog::gameOptionsPresetName(const QString& romMd5,
         const CoreGameOptionPresetInfo* own = catalog.preset(preset.id);
         return own ? QString::fromStdString(own->Label) : preset.label;
     }
-    const CoreGameOptionPresetInfo* own = catalog.presetFor(gameOptionIds(options));
+    const CoreGameOptionPresetInfo* own = catalog.presetFor(gameOptionIds(options), gameOptionLists(options));
     return own ? QString::fromStdString(own->Label) : QString();
 }
 
@@ -5678,12 +5957,22 @@ QString RollbackLobbyDialog::gameOptionsTag(const QString& romMd5,
 {
     if (options.isEmpty())
         return QString();
-    const QString presetName = gameOptionsPresetName(romMd5, options, preset);
-    if (!presetName.isEmpty())
-        return presetName;
-    if (options.size() == 1)
-        return gameOptionLabels(romMd5, options).value(0);
-    return tr("Custom (%1)", "game settings that aren't a preset, with how many options are on").arg(options.size());
+    QString tag = gameOptionsPresetName(romMd5, options, preset);
+    const QList<LobbyClient::LobbyGameOption> shown = shownGameOptions(romMd5, options);
+    if (tag.isEmpty())
+        tag = shown.size() == 1 ? gameOptionLabels(romMd5, shown).value(0)
+                                : tr("Custom (%1)", "game settings that aren't a preset, with how many options are on")
+                                      .arg(shown.size());
+    // A stage list says its name, or how many stages it has without one.
+    for (const auto& option : options)
+    {
+        CoreStageListInfo info;
+        const size_t stages = roomStageList(romMd5, option, info).size();
+        const QString name = stages > 0 ? roomStageListName(romMd5, option) : QString();
+        if (stages > 0)
+            tag += QStringLiteral(" · ") + (name.isEmpty() ? stageCountText(int(stages)) : name);
+    }
+    return tag;
 }
 
 QString RollbackLobbyDialog::gameOptionsNames(const QString& romMd5,
@@ -5691,12 +5980,36 @@ QString RollbackLobbyDialog::gameOptionsNames(const QString& romMd5,
                                               const LobbyClient::LobbyGameOption& preset) const
 {
     const QString presetName = gameOptionsPresetName(romMd5, options, preset);
-    return !presetName.isEmpty() ? presetName : gameOptionLabels(romMd5, options).join(QStringLiteral(", "));
+    return !presetName.isEmpty() ? presetName
+                                 : gameOptionLabels(romMd5, shownGameOptions(romMd5, options)).join(QStringLiteral(", "));
 }
 
 int RollbackLobbyDialog::gameOptionsLimit() const
 {
     return std::min(CoreGameOptionsMaxOptions, m_roomGameOptionsMax);
+}
+
+int RollbackLobbyDialog::seatedPlayers() const
+{
+    int players = 0;
+    for (const auto& seat : m_seats)
+        players += seat.userId != 0 ? 1 : 0;
+    return players;
+}
+
+QStringList RollbackLobbyDialog::matchGameOptionIds(int players) const
+{
+    const QStringList on = gameOptionIds(m_roomGameOptions);
+    if (on.isEmpty())
+        return on;
+    return GameSettingsCatalog::forRom(m_currentRoomMd5).matchOptions(on, m_roomGameOptionsPreset.id, players);
+}
+
+QStringList RollbackLobbyDialog::blankSaveGameOptions() const
+{
+    if (m_currentRoomId == 0 || m_roomGameOptions.isEmpty())
+        return {};
+    return GameSettingsCatalog::forRom(m_currentRoomMd5).blankSaveOptions(matchGameOptionIds(seatedPlayers()));
 }
 
 void RollbackLobbyDialog::updateGameOptionControls()
@@ -5730,7 +6043,7 @@ void RollbackLobbyDialog::updateGameOptionControls()
         const QList<SavedGameSettings> saved = catalog.savedSets(m_currentRoomMd5);
         const QString hint = SavedGameSettings::isPresetId(m_roomGameOptionsPreset.id)
             ? m_roomGameOptionsPreset.id.mid(5) : QString();
-        const GameSettingsChoice choice = catalog.choiceFor(on, saved, hint);
+        const GameSettingsChoice choice = catalog.choiceFor(on, gameOptionLists(m_roomGameOptions), saved, hint);
         items = catalog.listItems(saved, choice, limit, &current);
         if (const SavedGameSettings* set = choice.Type == GameSettingsChoice::Kind::Saved
                 ? GameSettingsCatalog::findSaved(saved, choice.Id) : nullptr)
@@ -5789,13 +6102,15 @@ void RollbackLobbyDialog::onGameSettingsPicked(int index)
         m_currentRoomState != "waiting")
         return;
     const QString choice = m_gameSettingsCombo->itemData(index).toString();
+    // "Custom (n)" is listed only while the room has it: nothing to change.
     if (choice == QLatin1String("custom"))
     {
-        openGameSettings();
+        updateGameOptionControls();
         return;
     }
 
     QStringList ids;
+    QMap<QString, QString> lists;
     QString name = tr("Default");
     QString savedId;
     const GameSettingsCatalog catalog = GameSettingsCatalog::forRom(m_currentRoomMd5);
@@ -5809,6 +6124,7 @@ void RollbackLobbyDialog::onGameSettingsPicked(int index)
             return;
         }
         ids = picked.Options;
+        lists = picked.Lists;
         if (picked.Type == GameSettingsChoice::Kind::Preset)
         {
             name = QString::fromStdString(catalog.preset(picked.Id)->Label);
@@ -5820,7 +6136,7 @@ void RollbackLobbyDialog::onGameSettingsPicked(int index)
         }
     }
     QString why;
-    if (!publishGameOptions(ids, &why, savedId))
+    if (!publishGameOptions(ids, lists, &why, savedId))
     {
         updateGameOptionControls();
         QMessageBox box(QMessageBox::Warning, tr("Game Settings"), tr("Couldn't use %1.").arg(name), QMessageBox::Ok, this);
@@ -5840,10 +6156,13 @@ void RollbackLobbyDialog::openGameSettings()
     const bool canEdit = editable && !catalog.isEmpty();
     const int limit = gameOptionsLimit();
     auto* dialog = new GameSettingsDialog(m_currentRoomGame, std::move(catalog), gameOptionIds(m_roomGameOptions),
-                                          canEdit, limit, this);
+                                          gameOptionLists(m_roomGameOptions), canEdit, limit, this);
     dialog->setAttribute(Qt::WA_DeleteOnClose);
     dialog->setProperty("editable", canEdit);
     dialog->setCoverPath(coverPathForMd5(m_currentRoomMd5));
+    dialog->setRomPath(localRomPathForMd5(m_currentRoomMd5));
+    if (canEdit)
+        dialog->setListsUnavailable(stageListsUnavailable());
     if (limit < CoreGameOptionsMaxOptions)
         dialog->setLimitNote(tr("This lobby server takes at most %1.").arg(limit));
     if (!canEdit)
@@ -5854,7 +6173,7 @@ void RollbackLobbyDialog::openGameSettings()
     // set into their own, to host with it later.
     dialog->enableSavedSets(m_currentRoomMd5);
     connect(dialog, &GameSettingsDialog::savedSetsChanged, this, &RollbackLobbyDialog::onSavedGameSettingsChanged);
-    dialog->setApplyCheck([this](const QStringList& ids, QString& error) {
+    dialog->setApplyCheck([this](const QStringList& ids, const QMap<QString, QString>& lists, QString& error) {
         // The room may have moved on while the view was open.
         if (m_currentRoomId == 0 || !m_client || m_currentRoomHostId != m_client->selfUserId() ||
             m_currentRoomState != "waiting")
@@ -5862,28 +6181,32 @@ void RollbackLobbyDialog::openGameSettings()
             error = tr("Game settings can't be changed now.");
             return false;
         }
-        return publishGameOptions(ids, &error);
+        return publishGameOptions(ids, lists, &error);
     });
     // Window-modal without a nested event loop: the room keeps going while it's
     // open, and a read-only view follows it (updateGameOptionControls).
     m_gameSettingsDialog = dialog;
     connect(dialog, &QDialog::finished, this, [this]() {
         m_gameSettingsDialog = nullptr;
-        // Cancel leaves the list showing Custom..., so it goes back to the room's.
         updateGameOptionControls();
     });
     dialog->open();
 }
 
-bool RollbackLobbyDialog::checkGameOptionsOnRom(const QString& romMd5, const QStringList& ids, QString* error) const
+bool RollbackLobbyDialog::checkGameOptionsOnRom(const QString& romMd5, const QStringList& ids,
+                                                const QMap<QString, QString>& lists, QString* error) const
 {
     if (ids.isEmpty())
         return true;
     std::vector<std::string> stdIds;
     for (const QString& id : ids)
         stdIds.push_back(id.toStdString());
+    std::map<std::string, std::string> stdLists;
+    for (auto it = lists.cbegin(); it != lists.cend(); ++it)
+        stdLists[it.key().toStdString()] = it.value().toStdString();
     CoreNetplayGameOptions resolved;
-    if (!CoreResolveGameOptions(localRomPathForMd5(romMd5).toStdU32String(), romMd5.toStdString(), stdIds, resolved))
+    if (!CoreResolveGameOptions(localRomPathForMd5(romMd5).toStdU32String(), romMd5.toStdString(), stdIds, stdLists,
+                                resolved))
     {
         if (error)
             *error = QString::fromStdString(CoreGetError());
@@ -5892,31 +6215,87 @@ bool RollbackLobbyDialog::checkGameOptionsOnRom(const QString& romMd5, const QSt
     return true;
 }
 
-bool RollbackLobbyDialog::publishGameOptions(const QStringList& ids, QString* error, const QString& savedHint,
-                                             bool remember)
+QMap<QString, QString> RollbackLobbyDialog::roomGameOptionLists() const
+{
+    return gameOptionLists(m_roomGameOptions);
+}
+
+QString RollbackLobbyDialog::stageListsUnavailable() const
+{
+    return m_roomGameOptionParams ? QString()
+                                  : tr("This lobby server can't carry a stage list. It needs an update first.");
+}
+
+bool RollbackLobbyDialog::publishGameOptions(const QStringList& ids, const QMap<QString, QString>& lists, QString* error,
+                                             const QString& savedHint, bool remember)
 {
     const GameSettingsCatalog catalog = GameSettingsCatalog::forRom(m_currentRoomMd5);
     const QStringList ordered = catalog.ordered(ids);
+    const QMap<QString, QString> orderedLists = catalog.listsFor(ordered, lists);
     if (ordered.size() > gameOptionsLimit())
     {
         if (error)
             *error = tr("This lobby server takes at most %1 game options.").arg(gameOptionsLimit());
         return false;
     }
+    // An older server would drop the list, and the match couldn't start.
+    const bool needsList = std::any_of(ordered.begin(), ordered.end(), [&](const QString& id) { return catalog.takesList(id); });
+    if (needsList && !m_roomGameOptionParams)
+    {
+        if (error)
+            *error = stageListsUnavailable();
+        return false;
+    }
 
     // Checked against the ROM now, so a ROM the pack doesn't fit (or a set the
     // pack's rules don't allow) says so before anyone joins expecting it; the
     // match start checks again.
-    if (!checkGameOptionsOnRom(m_currentRoomMd5, ordered, error))
+    if (!checkGameOptionsOnRom(m_currentRoomMd5, ordered, orderedLists, error))
         return false;
     QList<LobbyClient::LobbyGameOption> list;
+    QMap<QString, QString> savedListNames;
     for (const QString& id : ordered)
-        list.append(roomGameOption(*catalog.option(id)));
+    {
+        LobbyClient::LobbyGameOption option = roomGameOption(*catalog.option(id));
+        // A stage list goes as its code: everyone sees it, and the host's
+        // client makes the patches from it when the match starts. With it its
+        // name, when it has one: a preset list's English label, or the host's
+        // name for a saved list (the one the room has first, unless the
+        // server refused that name).
+        option.param = orderedLists.value(id);
+        if (!option.param.isEmpty())
+        {
+            const QList<SavedStageList> savedLists = catalog.savedStageLists(id);
+            QString hint;
+            for (const auto& roomOption : std::as_const(m_roomGameOptions))
+            {
+                if (roomOption.id == id && SavedGameSettings::isPresetId(roomOption.paramPresetId))
+                    hint = roomOption.paramPresetId.mid(5);
+            }
+            const StageListChoice listChoice = catalog.stageListChoiceFor(id, option.param, savedLists, hint);
+            CoreStageListInfo info;
+            const CoreStageListPreset* preset = listChoice.Type == StageListChoice::Kind::Preset && catalog.stageList(id, info)
+                ? info.preset(listChoice.Id.toStdString()) : nullptr;
+            const QString name = catalog.stageListName(id, listChoice, savedLists);
+            if (preset)
+            {
+                option.paramPresetId = listChoice.presetId();
+                option.paramPresetLabel = roomLabel(preset->EnglishLabel);
+            }
+            else if (listChoice.Type == StageListChoice::Kind::Saved && !m_refusedSavedNames.contains(name))
+            {
+                option.paramPresetId = listChoice.presetId();
+                option.paramPresetLabel = name;
+                savedListNames.insert(id, name);
+            }
+        }
+        list.append(option);
+    }
 
     // The preset they make up: a pack's, else a saved set of the host's by its
     // own name (once the server refused that name, none: custom).
     const QList<SavedGameSettings> saved = catalog.savedSets(m_currentRoomMd5);
-    const GameSettingsChoice choice = catalog.choiceFor(ordered, saved, savedHint);
+    const GameSettingsChoice choice = catalog.choiceFor(ordered, orderedLists, saved, savedHint);
     LobbyClient::LobbyGameOption presetEntry;
     if (choice.Type == GameSettingsChoice::Kind::Preset)
     {
@@ -5930,17 +6309,24 @@ bool RollbackLobbyDialog::publishGameOptions(const QStringList& ids, QString* er
     }
     if (remember)
         rememberRoomChoices(choice.settingsValues());
-    // Nothing to send when the room already has these.
-    if (ordered == gameOptionIds(m_roomGameOptions) && presetEntry.id == m_roomGameOptionsPreset.id &&
-        presetEntry.label == m_roomGameOptionsPreset.label)
+    // Nothing to send when the room already has these, named the same.
+    bool sameNames = list.size() == m_roomGameOptions.size();
+    for (int i = 0; sameNames && i < list.size(); ++i)
+        sameNames = list.at(i).paramPresetId == m_roomGameOptions.at(i).paramPresetId &&
+            list.at(i).paramPresetLabel == m_roomGameOptions.at(i).paramPresetLabel;
+    if (ordered == gameOptionIds(m_roomGameOptions) && orderedLists == gameOptionLists(m_roomGameOptions) && sameNames &&
+        presetEntry.id == m_roomGameOptionsPreset.id && presetEntry.label == m_roomGameOptionsPreset.label)
     {
         m_sentGameOptionsPreset = {};
+        m_sentSavedListNames.clear();
         updateGameOptionControls();
         return true;
     }
     m_client->updateRoomGameOptions(list, presetEntry);
     m_sentGameOptions = ordered;
+    m_sentGameOptionLists = orderedLists;
     m_sentGameOptionsPreset = presetEntry;
+    m_sentSavedListNames = savedListNames;
     // The list follows the room's ROOM_STATE. The server refuses a change
     // without a word, so it goes back to what the room has if none comes.
     m_gameOptionsResync->start();
@@ -5952,14 +6338,30 @@ void RollbackLobbyDialog::onGameOptionsResyncTimeout()
     // A saved set's name is the one thing in a change the server may refuse
     // that this client can't check first (its moderation filter): once the
     // room didn't take it, the same options go again without it.
+    // The same goes for a saved stage list's name; when the change carried
+    // both, both go without (the server refuses a change whole).
     const LobbyClient::LobbyGameOption sent = m_sentGameOptionsPreset;
+    const QMap<QString, QString> sentLists = m_sentSavedListNames;
     m_sentGameOptionsPreset = {};
+    m_sentSavedListNames.clear();
     const bool iAmHost = m_client && m_currentRoomId != 0 && m_currentRoomHostId == m_client->selfUserId();
-    if (iAmHost && m_currentRoomState == "waiting" && SavedGameSettings::isPresetId(sent.id) &&
-        m_roomGameOptionsPreset.id != sent.id)
+    const bool presetRefused = SavedGameSettings::isPresetId(sent.id) && m_roomGameOptionsPreset.id != sent.id;
+    bool listRefused = false;
+    for (auto it = sentLists.cbegin(); it != sentLists.cend(); ++it)
     {
-        m_refusedSavedNames.insert(sent.label);
-        if (publishGameOptions(m_sentGameOptions, nullptr, sent.id.mid(5), false))
+        bool kept = false;
+        for (const auto& option : std::as_const(m_roomGameOptions))
+            kept = kept || (option.id == it.key() && option.paramPresetLabel == it.value());
+        listRefused = listRefused || !kept;
+    }
+    if (iAmHost && m_currentRoomState == "waiting" && (presetRefused || listRefused))
+    {
+        if (SavedGameSettings::isPresetId(sent.id))
+            m_refusedSavedNames.insert(sent.label);
+        for (const QString& name : sentLists)
+            m_refusedSavedNames.insert(name);
+        if (publishGameOptions(m_sentGameOptions, m_sentGameOptionLists, nullptr,
+                               SavedGameSettings::isPresetId(sent.id) ? sent.id.mid(5) : QString(), false))
             return;
     }
     updateGameOptionControls();
@@ -5971,10 +6373,14 @@ void RollbackLobbyDialog::onSavedGameSettingsChanged()
     // The room has one of the host's saved sets by its name: it hears the new
     // name, or that its options are custom now (replaced or deleted). What's
     // remembered for the next room still names the set (gone: Default).
+    // A saved stage list the room has (or now matches) does the same.
     const bool iAmHost = m_client && m_currentRoomId != 0 && m_currentRoomHostId == m_client->selfUserId();
-    if (iAmHost && m_currentRoomState == "waiting" && !matchTransportInProgress() &&
-        SavedGameSettings::isPresetId(m_roomGameOptionsPreset.id) && !m_roomGameOptions.isEmpty())
-        publishGameOptions(gameOptionIds(m_roomGameOptions), nullptr, m_roomGameOptionsPreset.id.mid(5), false);
+    const bool hasList = !gameOptionLists(m_roomGameOptions).isEmpty();
+    if (iAmHost && m_currentRoomState == "waiting" && !matchTransportInProgress() && !m_roomGameOptions.isEmpty() &&
+        (SavedGameSettings::isPresetId(m_roomGameOptionsPreset.id) || hasList))
+        publishGameOptions(gameOptionIds(m_roomGameOptions), gameOptionLists(m_roomGameOptions), nullptr,
+                           SavedGameSettings::isPresetId(m_roomGameOptionsPreset.id) ? m_roomGameOptionsPreset.id.mid(5)
+                                                                                      : QString(), false);
 }
 
 void RollbackLobbyDialog::refreshStartButton()
@@ -6027,7 +6433,8 @@ void RollbackLobbyDialog::refreshStartButton()
     QStringList needGameOptions;
     QStringList needMoreGameOptions;
     int fewestGameOptions = CoreGameOptionsMaxOptions;
-    const int gameOptionCount = int(m_roomGameOptions.size());
+    // With what the room's preset adds for the players seated (Teams at 4).
+    const int gameOptionCount = iAmHost ? int(matchGameOptionIds(seated).size()) : int(m_roomGameOptions.size());
     const QString gameOptionNames = gameOptionsNames(m_currentRoomMd5, m_roomGameOptions, m_roomGameOptionsPreset);
     if (gameOptionCount > 0)
     {
@@ -7011,20 +7418,21 @@ void RollbackLobbyDialog::onRoomLeft(const QString& reason)
     m_roomSaveDataHash.clear();
     m_saveDataCapableUsers.clear();
     m_hostSaveChoice.reset();
-    m_hostGameOptionIds.clear();
     m_roomGameOptionsOffered = false;
     m_roomGameOptionsMax = CoreGameOptionsLegacyMaxOptions;
+    m_roomGameOptionParams = false;
     m_roomGameOptions.clear();
     m_roomGameOptionsPreset = {};
     m_gameOptionsUserMax.clear();
     m_gameOptionsResync->stop();
     m_sentGameOptions.clear();
+    m_sentGameOptionLists.clear();
     m_sentGameOptionsPreset = {};
+    m_sentSavedListNames.clear();
     m_gameSettingsPick->stop();
     // Nothing left to show or change.
     if (m_gameSettingsDialog)
         m_gameSettingsDialog->reject();
-    m_publishSaveChoiceWhenWaiting = false;
     if (!m_matchSaveActive)
     {
         m_matchSave.reset();
@@ -7032,6 +7440,7 @@ void RollbackLobbyDialog::onRoomLeft(const QString& reason)
         m_keepCopyFile.clear();
         m_keepCopyEnabled = false;
         m_keepCopyFromPick = false;
+        m_keepCopyHolds.reset();
     }
     if (m_saveDataCheck) m_saveDataCheck->setVisible(false);
     updateSaveDataControls();
@@ -7106,7 +7515,9 @@ void RollbackLobbyDialog::onChatSendClicked()
     const QString text = m_chatInput->text().trimmed();
     if (text.isEmpty()) return;
     const int tab = activeChatTab();
-    const QString channel = tab == kChatTabSpectators && (m_spectatingMatchId != 0 || m_playerChatLive) ? CHANNEL_SPECTATE
+    const bool spectateOpen = watchingStream(m_chatStreamShown) ||
+                              (m_playerChatLive && m_chatStreamShown == m_playerChatMatchId);
+    const QString channel = tab == kChatTabSpectators && spectateOpen ? CHANNEL_SPECTATE
         : tab == kChatTabRoom && m_currentRoomId != 0 ? CHANNEL_ROOM
                                                       : CHANNEL_LOBBY;
     if (handleSlashCommand(channel, text)) { m_chatInput->clear(); return; }
@@ -7117,7 +7528,7 @@ void RollbackLobbyDialog::onChatSendClicked()
         return;
     }
     if (channel == QLatin1String(CHANNEL_SPECTATE))
-        sendSpectatorChat(text);
+        sendSpectatorChatTo(m_chatStreamShown, text);
     else if (channel == QLatin1String(CHANNEL_ROOM))
         sendRoomChat(text);
     else
@@ -7150,15 +7561,35 @@ void RollbackLobbyDialog::onChatMessageReceived(const LobbyClient::ChatMessage& 
         // A live replay's chat, shared by those watching it and the match's
         // players, shown in the Spectators tab. Lines that arrive after this client
         // left it are dropped.
-        const bool watching = m_spectatingMatchId != 0;
+        const QString line = lineFor(msg.message, m_client->isOnThisPc(msg.fromUserId));
+        if (msg.matchId != 0)
+        {
+            // The server names the stream: each keeps its own lines, and the
+            // tab shows the one picked.
+            const bool ownMatch = m_playerChatLive && msg.matchId == m_playerChatMatchId;
+            if (!ownMatch && !watchingStream(msg.matchId))
+                return;
+            appendSpectateChatLine(msg.matchId, line);
+            if (mentionsMe && msg.matchId == m_chatStreamShown)
+                noteMention(CHANNEL_SPECTATE, msg);
+            if (msg.matchId == m_spectatingMatchId)
+                emit spectatorChatReceived(msg.fromUsername, msg.message);
+            else if (m_viewerHost->has(msg.matchId))
+                m_viewerHost->chat(msg.matchId, msg.fromUsername, msg.message);
+            else
+                showSpectatorCommentOverGame(msg);
+            return;
+        }
+        // A server that doesn't name it has one stream per connection.
+        const bool watching = m_spectatingMatchId != 0 || m_viewerHost->count() > 0;
         if (!watching && !m_playerChatLive)
             return;
-        appendChatLine(CHANNEL_SPECTATE, lineFor(msg.message, m_client->isOnThisPc(msg.fromUserId)));
+        appendChatLine(CHANNEL_SPECTATE, line);
         if (mentionsMe)
             noteMention(CHANNEL_SPECTATE, msg);
-        if (watching)
+        if (m_spectatingMatchId != 0)
             emit spectatorChatReceived(msg.fromUsername, msg.message);
-        else
+        else if (m_playerChatLive)
             showSpectatorCommentOverGame(msg);
         return;
     }
@@ -7234,14 +7665,27 @@ void RollbackLobbyDialog::sendRoomChat(const QString& message)
 
 void RollbackLobbyDialog::sendSpectatorChat(const QString& message)
 {
-    if (!m_client || (m_spectatingMatchId == 0 && !m_playerChatLive))
+    // From the main window's game: its own stream, or the match it plays.
+    sendSpectatorChatTo(m_spectatingMatchId != 0 ? m_spectatingMatchId
+                        : m_playerChatLive ? m_playerChatMatchId : 0,
+                        message);
+}
+
+void RollbackLobbyDialog::sendSpectatorChatTo(quint64 matchId, const QString& message)
+{
+    if (!m_client || matchId == 0)
+        return;
+    const bool ownMatch = m_playerChatLive && matchId == m_playerChatMatchId;
+    if (!ownMatch && !watchingStream(matchId))
         return;
 
     const QString text = message.trimmed();
     if (text.isEmpty())
         return;
 
-    m_client->sendChat(CHANNEL_SPECTATE, text);
+    // Naming the stream lets a server keeping several per connection route
+    // the line; one that doesn't know the field ignores it.
+    m_client->sendChat(CHANNEL_SPECTATE, text, matchId);
 }
 
 LagReport RollbackLobbyDialog::lagReport(bool wholeMatch) const
@@ -7313,6 +7757,12 @@ void RollbackLobbyDialog::appendChatLine(const QString& channel, const QString& 
     {
         target = m_chatViewSpectate;
         tab = kChatTabSpectators;
+        // Kept with the stream the tab shows, so switching streams and back
+        // loses nothing.
+        QStringList& lines = m_spectateChatLines[m_chatStreamShown];
+        lines.append(text);
+        if (lines.size() > kSpectateChatKeep)
+            lines.removeFirst();
     }
     if (!target)
         return;
@@ -7326,6 +7776,11 @@ void RollbackLobbyDialog::appendChatLine(const QString& channel, const QString& 
 void RollbackLobbyDialog::appendChatSystemLine(const QString& channel, const QString& text,
                                                const QString& icon, Role role)
 {
+    appendChatLine(channel, chatSystemLineHtml(text, icon, role));
+}
+
+QString RollbackLobbyDialog::chatSystemLineHtml(const QString& text, const QString& icon, Role role) const
+{
     const Tokens& t = LobbyTheme::tokens();
     const auto ts = QDateTime::currentDateTime().toString("hh:mm");
     QString mark;
@@ -7334,9 +7789,9 @@ void RollbackLobbyDialog::appendChatSystemLine(const QString& channel, const QSt
         const QColor color = role == Role::Muted ? t.muted : LobbyTheme::roleColor(role);
         mark = chatIconHtml(icon, color, 13) + QStringLiteral("&nbsp;");
     }
-    appendChatLine(channel, QString("<span style='color:%1; font-size:9px;'>%2</span>&nbsp; %3"
-                                    "<i style='color:%1;'>%4</i>")
-        .arg(t.muted.name(), ts, mark, text));
+    return QString("<span style='color:%1; font-size:9px;'>%2</span>&nbsp; %3"
+                   "<i style='color:%1;'>%4</i>")
+        .arg(t.muted.name(), ts, mark, text);
 }
 
 bool RollbackLobbyDialog::handleSlashCommand(const QString& channel, const QString& text)
@@ -8091,11 +8546,17 @@ void RollbackLobbyDialog::launchSpectate(quint64 matchId, const QString& gameNam
 {
     m_spectatingMatchId = matchId;
     m_spectateStreamArmed = false; // wait for this subscribe's SPECTATE_BEGIN before accepting data
+    m_mainStreamState = StreamViewer::State::Connecting;
     m_client->startSpectate(matchId);
-    m_chatViewSpectate->clear();
+    m_streamTitles.insert(matchId, streamTitle(matchId));
+    // The main window's watch is the Spectators chat's until another is picked.
+    m_chatStreamPick = 0;
+    m_spectateChatLines.remove(matchId);
     setSpectatorChatVisible(true);
+    refreshSpectateChatView(true);
     emit spectateLaunch(matchId, gameName, romPath);
-    appendChatSystemLine(CHANNEL_SPECTATE, tr("Connecting to live replay…"), QStringLiteral("eye-line"));
+    appendSpectateSystemLine(matchId, tr("Connecting to live replay…"), QStringLiteral("eye-line"));
+    refreshWatchTracker();
     onRoomListChanged();
 }
 
@@ -8113,11 +8574,15 @@ void RollbackLobbyDialog::startPendingSpectate()
 void RollbackLobbyDialog::stopSpectating()
 {
     if (m_spectatingMatchId == 0) return;
+    const quint64 matchId = m_spectatingMatchId;
     m_client->stopSpectate(m_spectatingMatchId);
     m_spectatingMatchId = 0;
     m_spectateStreamArmed = false;
-    setSpectatorChatVisible(false);
+    m_spectateChatLines.remove(matchId);
+    m_streamTitles.remove(matchId);
+    refreshSpectatorChatAvailability();
     emit liveReplayViewerCountCleared();
+    refreshWatchTracker();
     onRoomListChanged();
 }
 
@@ -8131,12 +8596,33 @@ void RollbackLobbyDialog::setSpectatorChatVisible(bool visible)
     m_pendingMentions[kChatTabSpectators].clear();
     if (visible && m_chatSplitTab != kChatTabSpectators)
         m_chatTabs->setCurrentIndex(kChatTabSpectators);
+    refreshSpectateChatView();
     refreshSpectatorTab();
     refreshChatInput();
 }
 
+void RollbackLobbyDialog::refreshSpectatorChatAvailability()
+{
+    const bool needed = m_spectatingMatchId != 0 || m_playerChatMatchId != 0 ||
+                        (m_viewerHost && m_viewerHost->count() > 0);
+    if (needed != m_chatTabAvailable[kChatTabSpectators])
+        setSpectatorChatVisible(needed);
+    else
+        refreshSpectateChatView();
+}
+
 void RollbackLobbyDialog::onSpectateBegan(quint64 matchId, const QByteArray& manifest)
 {
+    if (m_viewerHost->has(matchId))
+    {
+        // Its window applies the manifest: cheats, saves and game options are
+        // per process, and this one may be watching or playing something else.
+        m_viewerHost->began(matchId, manifest);
+        appendSpectateSystemLine(matchId, tr("Watching — buffering the match…"));
+        if (m_client->spectatorChatSupported())
+            appendSpectateSystemLine(matchId, tr("The players can read this chat too."), QStringLiteral("eye-line"));
+        return;
+    }
     if (matchId != m_spectatingMatchId) return;
     if (m_spectateStreamArmed) return;
     // Use the same parser and session-only cheat set as players, before any
@@ -8151,13 +8637,18 @@ void RollbackLobbyDialog::onSpectateBegan(quint64 matchId, const QByteArray& man
     // The session boundary: everything on the wire before this is leftover from a
     // prior watch of this same match. Arm the stream now; keyframe + tail follow.
     m_spectateStreamArmed = true;
-    appendChatSystemLine(CHANNEL_SPECTATE, tr("Watching — buffering the match…"));
+    appendSpectateSystemLine(matchId, tr("Watching — buffering the match…"));
     if (m_client->spectatorChatSupported())
-        appendChatSystemLine(CHANNEL_SPECTATE, tr("The players can read this chat too."), QStringLiteral("eye-line"));
+        appendSpectateSystemLine(matchId, tr("The players can read this chat too."), QStringLiteral("eye-line"));
 }
 
 void RollbackLobbyDialog::onSpectateData(quint64 matchId, const QByteArray& bytes, int liveFrame, qint64 offset)
 {
+    if (m_viewerHost->has(matchId))
+    {
+        m_viewerHost->data(matchId, bytes, liveFrame, offset);
+        return;
+    }
     if (matchId != m_spectatingMatchId) return;
     if (!m_spectateStreamArmed) return; // stale chunk from a previous watch — drop it
     emit spectateStreamData(bytes, liveFrame, offset);
@@ -8165,6 +8656,11 @@ void RollbackLobbyDialog::onSpectateData(quint64 matchId, const QByteArray& byte
 
 void RollbackLobbyDialog::onSpectateKeyframe(quint64 matchId, int frame, const QByteArray& savestate)
 {
+    if (m_viewerHost->has(matchId))
+    {
+        m_viewerHost->keyframe(matchId, frame, savestate);
+        return;
+    }
     if (matchId != m_spectatingMatchId) return;
     if (!m_spectateStreamArmed) return; // stale keyframe from a previous watch — drop it
     emit spectateStreamKeyframe(frame, savestate);
@@ -8172,27 +8668,63 @@ void RollbackLobbyDialog::onSpectateKeyframe(quint64 matchId, int frame, const Q
 
 void RollbackLobbyDialog::onSpectateEnded(quint64 matchId, const QString& reason)
 {
+    if (m_viewerHost->has(matchId))
+    {
+        // Its window says so for a moment, then closes (onViewerWindowClosed).
+        m_viewerHost->ended(matchId, reason);
+        appendSpectateSystemLine(matchId, tr("The live replay ended."));
+        return;
+    }
     if (matchId != m_spectatingMatchId) return;
     m_spectatingMatchId = 0; // server already ended it; don't echo SPECTATE_STOP
-    setSpectatorChatVisible(false);
+    m_spectateChatLines.remove(matchId);
+    m_streamTitles.remove(matchId);
+    refreshSpectatorChatAvailability();
     emit liveReplayViewerCountCleared();
     emit spectateStreamClosed(reason);
+    refreshWatchTracker();
     onRoomListChanged();
+}
+
+QString RollbackLobbyDialog::spectateReasonText(const QString& reason, bool* known) const
+{
+    QString text;
+    if (reason == QLatin1String("not_broadcasting"))
+        text = tr("That live replay isn't available anymore.");
+    else if (reason == QLatin1String("ended"))
+        text = tr("That live replay just ended.");
+    else if (reason == QLatin1String("invalid_manifest"))
+        text = tr("The live replay's cheat settings are missing or invalid. The host and lobby server need to support spectator cheat sync.");
+    if (known != nullptr)
+        *known = !text.isEmpty();
+    return text.isEmpty() ? reason : text;
 }
 
 void RollbackLobbyDialog::onSpectateFailed(quint64 matchId, const QString& reason)
 {
+    if (m_viewerHost->has(matchId))
+    {
+        // Shown once here, not in a box per window. Nothing retries it: the
+        // lobby counts every refused start against this PC.
+        appendChatSystemLine(m_currentRoomId != 0 ? CHANNEL_ROOM : CHANNEL_LOBBY,
+                             tr("Couldn't watch %1: %2").arg(m_streamTitles.value(matchId), spectateReasonText(reason)),
+                             QStringLiteral("error-warning-line"), Role::Warn);
+        m_viewerHost->close(matchId);
+        return;
+    }
     if (matchId != m_spectatingMatchId) return;
     m_spectatingMatchId = 0;
-    setSpectatorChatVisible(false);
+    m_spectateChatLines.remove(matchId);
+    m_streamTitles.remove(matchId);
+    refreshSpectatorChatAvailability();
     emit liveReplayViewerCountCleared();
-    const QString human =
-        reason == "not_broadcasting" ? tr("That live replay isn't available anymore.") :
-        reason == "ended"            ? tr("That live replay just ended.") :
-        reason == "invalid_manifest" ? tr("The live replay's cheat settings are missing or invalid. The host and lobby server need to support spectator cheat sync.") :
-                                       tr("Couldn't watch: %1").arg(reason);
+    bool known = false;
+    QString human = spectateReasonText(reason, &known);
+    if (!known)
+        human = tr("Couldn't watch: %1").arg(reason);
     QMessageBox::information(this, tr("Live Replay"), human);
     emit spectateStreamClosed(reason);
+    refreshWatchTracker();
     onRoomListChanged();
 }
 
@@ -8200,6 +8732,9 @@ void RollbackLobbyDialog::onBroadcastViewerCount(quint64 matchId, int viewerCoun
 {
     // Cards update in place, so audience changes keep the scroll position.
     onRoomListChanged();
+    // A viewer window shows its own stream's audience.
+    if (m_viewerHost->has(matchId))
+        m_viewerHost->viewers(matchId, viewerCount);
     if (m_broadcasting && matchId == m_broadcastMatchId)
     {
         emit liveReplayViewerCountChanged(viewerCount, false);
@@ -8214,6 +8749,279 @@ void RollbackLobbyDialog::onBroadcastViewerCount(quint64 matchId, int viewerCoun
         // count as the broadcaster. They are playing, rather than spectating.
         emit liveReplayViewerCountChanged(viewerCount, false);
     }
+}
+
+// ── Viewer windows and the Watching strip ─────────────────────────────
+//
+// "Watch in New Window" plays a live replay in another copy of RMG-K (one game
+// per process), fed by this window's lobby connection through
+// StreamViewerHost. The strip under the top bar lists everything watched, the
+// main window's watch included.
+
+namespace
+{
+    // A game of this PC's own closes the viewer windows: an emulator running
+    // behind a rollback match costs it frames. The one switch for that.
+    constexpr bool kCloseViewerWindowsForOwnGame = true;
+} // namespace
+
+bool RollbackLobbyDialog::watchingStream(quint64 matchId) const
+{
+    return matchId != 0 && (matchId == m_spectatingMatchId || (m_viewerHost && m_viewerHost->has(matchId)));
+}
+
+QString RollbackLobbyDialog::streamTitle(quint64 matchId) const
+{
+    for (const auto& room : m_client->rooms())
+    {
+        if (room.matchId == matchId)
+            return room.playerNames.isEmpty() ? room.name : room.playerNames.join(tr(" vs "));
+    }
+    return m_streamTitles.value(matchId);
+}
+
+QString RollbackLobbyDialog::romPathForMatch(const LobbyClient::LobbyRoomSummary& room) const
+{
+    if (!room.romMd5.isEmpty())
+        return localRomPathForMd5(room.romMd5);
+    // A room without an MD5 goes by the game's name, as the main window would.
+    for (auto it = m_roms.constBegin(); it != m_roms.constEnd(); ++it)
+    {
+        if (QString::fromStdString(it.value().GoodName).compare(room.romName, Qt::CaseInsensitive) == 0)
+            return it.key();
+    }
+    return QString();
+}
+
+void RollbackLobbyDialog::openViewerWindow(const LobbyClient::LobbyRoomSummary& roomRef)
+{
+    // A copy: the message boxes below run an event loop.
+    const LobbyClient::LobbyRoomSummary room = roomRef;
+    if (m_viewerHost->count() >= StreamViewer::kMaxViewerWindows)
+    {
+        QMessageBox::information(this, tr("Too many windows"),
+            tr("You can watch up to %1 live replays in windows of their own at once. Close one to open another.")
+                .arg(StreamViewer::kMaxViewerWindows));
+        return;
+    }
+    const QString romPath = romPathForMatch(room);
+    if (romPath.isEmpty())
+    {
+        QMessageBox::warning(this, tr("ROM not found"),
+            QString(tr("You don't have the ROM this match is using (%1).\n\n"
+                    "Add it to your ROM directory and refresh the list, then try again."))
+                .arg(room.romName));
+        return;
+    }
+    // It would start this match in the main window once the game there closes.
+    if (m_pendingSpectate.matchId == room.matchId)
+        m_pendingSpectate = PendingSpectate{};
+
+    const QString title = streamTitle(room.matchId);
+    // Several games playing sound at once is noise: a new window starts
+    // muted while anything else is audible.
+    const bool mainAudible = CoreIsEmulationRunning() && !CoreIsVolumeMuted();
+    const bool startMuted = mainAudible || m_viewerHost->anyAudible();
+    QString error;
+    if (!m_viewerHost->open(room.matchId, title, room.romName, romPath, startMuted, &error))
+    {
+        QMessageBox::warning(this, tr("Live Replay"), error);
+        return;
+    }
+    m_client->startSpectate(room.matchId);
+    m_streamTitles.insert(room.matchId, title);
+    m_lastViewerStream = room.matchId;
+    m_spectateChatLines.remove(room.matchId);
+    const bool tabShown = m_chatTabAvailable[kChatTabSpectators];
+    appendSpectateSystemLine(room.matchId, tr("Opening %1 in a window of its own…").arg(title),
+                             QStringLiteral("external-link-line"));
+    // The tab comes up (and is picked) when it's the first stream; otherwise
+    // it stays on what it shows.
+    if (!tabShown)
+        setSpectatorChatVisible(true);
+    else
+        refreshSpectateChatView();
+    refreshWatchTracker();
+    onRoomListChanged();
+}
+
+void RollbackLobbyDialog::onViewerWindowClosed(quint64 matchId, const QString& failure)
+{
+    // Its window is gone, so the stream is too; the lobby may have ended it
+    // already.
+    if (m_client->isSpectating(matchId))
+        m_client->stopSpectate(matchId);
+    if (!failure.isEmpty())
+    {
+        appendChatSystemLine(m_currentRoomId != 0 ? CHANNEL_ROOM : CHANNEL_LOBBY,
+                             tr("Couldn't watch %1: %2").arg(m_streamTitles.value(matchId), failure),
+                             QStringLiteral("error-warning-line"), Role::Warn);
+    }
+    m_spectateChatLines.remove(matchId);
+    if (matchId != m_spectatingMatchId)
+        m_streamTitles.remove(matchId);
+    if (m_chatStreamPick == matchId)
+        m_chatStreamPick = 0;
+    if (m_lastViewerStream == matchId)
+        m_lastViewerStream = 0;
+    refreshSpectatorChatAvailability();
+    refreshWatchTracker();
+    onRoomListChanged();
+}
+
+void RollbackLobbyDialog::stopWatchingMatch(quint64 matchId)
+{
+    if (m_viewerHost->has(matchId))
+    {
+        // Off the stream at once; the window follows (onViewerWindowClosed).
+        if (m_client->isSpectating(matchId))
+            m_client->stopSpectate(matchId);
+        m_viewerHost->close(matchId);
+        return;
+    }
+    if (matchId != 0 && matchId == m_spectatingMatchId)
+    {
+        m_pendingSpectate = PendingSpectate{};
+        emit spectateStreamClosed(QStringLiteral("stopped"));
+    }
+}
+
+void RollbackLobbyDialog::focusStream(quint64 matchId)
+{
+    if (matchId != 0 && matchId == m_spectatingMatchId)
+        emit mainStreamWindowRequested();
+    else
+        m_viewerHost->raise(matchId);
+}
+
+void RollbackLobbyDialog::ownGameStarting()
+{
+    if (!kCloseViewerWindowsForOwnGame || m_viewerHost->count() == 0)
+        return;
+    for (const auto& stream : m_viewerHost->streams())
+        stopWatchingMatch(stream.matchId);
+    appendChatSystemLine(m_currentRoomId != 0 ? CHANNEL_ROOM : CHANNEL_LOBBY,
+                         tr("Your game is starting, so the live replay windows were closed: "
+                            "games running in the background cost a rollback match frames."),
+                         QStringLiteral("external-link-line"));
+}
+
+void RollbackLobbyDialog::setMainStreamState(StreamViewer::State state)
+{
+    if (m_mainStreamState == state)
+        return;
+    m_mainStreamState = state;
+    refreshWatchTracker();
+}
+
+void RollbackLobbyDialog::setMainStreamMuted(bool muted)
+{
+    if (m_mainStreamMuted == muted)
+        return;
+    m_mainStreamMuted = muted;
+    refreshWatchTracker();
+}
+
+void RollbackLobbyDialog::refreshWatchTracker()
+{
+    if (m_watchTracker == nullptr)
+        return;
+    QList<WatchEntryView> entries;
+    const quint64 shown = chatStream();
+    if (m_spectatingMatchId != 0)
+    {
+        WatchEntryView view;
+        view.matchId = m_spectatingMatchId;
+        view.title = m_streamTitles.value(m_spectatingMatchId, streamTitle(m_spectatingMatchId));
+        const auto room = std::find_if(m_client->rooms().cbegin(), m_client->rooms().cend(),
+            [this](const LobbyClient::LobbyRoomSummary& r) { return r.matchId == m_spectatingMatchId; });
+        if (room != m_client->rooms().cend())
+            view.game = room->romName;
+        view.state = m_mainStreamState;
+        view.muted = m_mainStreamMuted;
+        view.mainWindow = true;
+        view.selected = shown == m_spectatingMatchId;
+        entries.append(view);
+    }
+    for (const auto& stream : m_viewerHost->streams())
+    {
+        WatchEntryView view;
+        view.matchId = stream.matchId;
+        view.title = stream.title;
+        view.game = stream.game;
+        view.state = stream.state;
+        view.muted = stream.muted;
+        view.selected = shown == stream.matchId;
+        entries.append(view);
+    }
+    // Marking the chat's stream only means something with several to pick from.
+    if (entries.size() < 2)
+    {
+        for (WatchEntryView& view : entries)
+            view.selected = false;
+    }
+    m_watchTracker->setEntries(entries);
+}
+
+quint64 RollbackLobbyDialog::chatStream() const
+{
+    if (watchingStream(m_chatStreamPick))
+        return m_chatStreamPick;
+    // A player's own viewers come first: that chat is theirs to answer.
+    if (m_playerChatLive && m_playerChatMatchId != 0)
+        return m_playerChatMatchId;
+    if (m_spectatingMatchId != 0)
+        return m_spectatingMatchId;
+    if (watchingStream(m_lastViewerStream))
+        return m_lastViewerStream;
+    const auto streams = m_viewerHost ? m_viewerHost->streams() : QList<StreamViewerHost::StreamInfo>();
+    if (!streams.isEmpty())
+        return streams.last().matchId;
+    // A finished match's chat stays readable until the next.
+    return m_playerChatMatchId;
+}
+
+void RollbackLobbyDialog::refreshSpectateChatView(bool reload)
+{
+    if (m_chatViewSpectate == nullptr)
+        return;
+    const quint64 stream = chatStream();
+    if (stream != m_chatStreamShown || reload)
+    {
+        m_chatStreamShown = stream;
+        m_chatViewSpectate->clear();
+        // Clearing dropped the document's images; the lines need them back.
+        for (auto it = m_chatIcons.constBegin(); it != m_chatIcons.constEnd(); ++it)
+            m_chatViewSpectate->document()->addResource(QTextDocument::ImageResource, QUrl(it.key()), it.value());
+        for (const QString& line : m_spectateChatLines.value(stream))
+            m_chatViewSpectate->addLine(line);
+        m_pendingMentions[kChatTabSpectators].clear();
+        refreshMentionJump();
+    }
+    if (m_spectatorStrip)
+        m_spectatorStrip->setVisible(m_playerChatMatchId != 0 && m_chatStreamShown == m_playerChatMatchId);
+    refreshSpectatorTab();
+    refreshChatInput();
+    refreshWatchTracker();
+}
+
+void RollbackLobbyDialog::appendSpectateChatLine(quint64 matchId, const QString& html)
+{
+    if (matchId == m_chatStreamShown)
+    {
+        appendChatLine(CHANNEL_SPECTATE, html);
+        return;
+    }
+    // Another stream's: kept for when it's picked.
+    QStringList& lines = m_spectateChatLines[matchId];
+    lines.append(html);
+    if (lines.size() > kSpectateChatKeep)
+        lines.removeFirst();
+}
+
+void RollbackLobbyDialog::appendSpectateSystemLine(quint64 matchId, const QString& text, const QString& icon)
+{
+    appendSpectateChatLine(matchId, chatSystemLineHtml(text, icon, Role::Muted));
 }
 
 void RollbackLobbyDialog::abortMatchStart(const QString& reason)
@@ -8257,6 +9065,7 @@ void RollbackLobbyDialog::onMatchBegin(quint64 matchId, const QList<LobbyClient:
     // clear the pre-match settings and report this match as finished, leaving
     // us playing while the lobby shows us waiting to join.
     m_pendingSpectate = PendingSpectate{};
+    ownGameStarting();
     const bool wasWatching = m_spectatingMatchId != 0;
     if (wasWatching)
     {
@@ -8471,13 +9280,53 @@ void RollbackLobbyDialog::onMatchBegin(quint64 matchId, const QList<LobbyClient:
     appendChatSystemLine(CHANNEL_ROOM, tr("Synchronizing pre-match settings..."));
     if (m_client->selfUserId() == m_currentRoomHostId)
     {
-        m_client->setPrematchSaveData(m_roomSaveDataEnabled && m_hostSaveChoice
-            ? std::optional<CoreNetplaySaveData>(m_hostSaveChoice->Data) : std::nullopt);
+        // What this match is played with is decided here, from the room and
+        // who's in the match: the room's game settings and what its preset
+        // adds for this many players (every seat counts, the ones on the same
+        // PC too), and the host's pick of save, or a blank save when those
+        // settings need one. Late joiners get this match's manifest, so
+        // neither changes until the next match.
+        int players = 0;
+        for (const auto& p : peers)
+            players += p.slot >= 1 && p.slot <= 4 ? 1 : 0;
+        const GameSettingsCatalog catalog = GameSettingsCatalog::forRom(m_currentRoomMd5);
+        const QStringList roomIds = gameOptionIds(m_roomGameOptions);
+        const QStringList matchIds = matchGameOptionIds(players);
+        QStringList added;
+        for (const QString& id : matchIds)
+        {
+            if (!roomIds.contains(id))
+                added << id;
+        }
+        if (!added.isEmpty())
+            CoreAddCallbackMessage(CoreDebugMessageType::Info,
+                QString("Game settings: %1 with %2 players also turns on %3")
+                    .arg(m_roomGameOptionsPreset.id).arg(players).arg(added.join(QStringLiteral(", ")))
+                    .toUtf8().constData());
+        const QStringList blankFor = catalog.blankSaveOptions(matchIds);
+        std::optional<CoreNetplaySaveData> startingSave;
+        if (m_roomSaveDataEnabled && m_hostSaveChoice)
+            startingSave = blankFor.isEmpty() ? m_hostSaveChoice->Data : CoreNetplaySaveData();
+        if (!blankFor.isEmpty())
+            CoreAddCallbackMessage(CoreDebugMessageType::Info,
+                QString("Save data: the match starts from a blank save (%1 need one)")
+                    .arg(blankFor.join(QStringLiteral(", "))).toUtf8().constData());
+        m_client->setPrematchSaveData(startingSave);
+
         // Checked against the ROM file about to boot, so an option that no
         // longer fits it stops the match here rather than on every player.
+        std::vector<std::string> ids;
+        for (const QString& id : matchIds)
+            ids.push_back(id.toStdString());
+        // A stage list becomes its patches here, from the code the room shows,
+        // so what every player sees is what the match plays; they, late
+        // joiners, live viewers and the replay get the patches.
+        std::map<std::string, std::string> lists;
+        const QMap<QString, QString> roomLists = roomGameOptionLists();
+        for (auto it = roomLists.cbegin(); it != roomLists.cend(); ++it)
+            lists[it.key().toStdString()] = it.value().toStdString();
         CoreNetplayGameOptions gameOptions;
-        if (!CoreResolveGameOptions(localRomFile.toStdU32String(), m_currentRoomMd5.toStdString(),
-                                    m_hostGameOptionIds, gameOptions))
+        if (!CoreResolveGameOptions(localRomFile.toStdU32String(), m_currentRoomMd5.toStdString(), ids, lists, gameOptions))
         {
             abortMatchStart(tr("Match start failed: %1").arg(QString::fromStdString(CoreGetError())));
             return;
@@ -8652,6 +9501,7 @@ void RollbackLobbyDialog::onMatchAdmitBegin(quint64 matchId, quint64 admitId, in
     if (joiner.userId == selfId)
     {
         m_lateJoin.role = LateJoinRole::Joiner;
+        ownGameStarting();
         // The game is about to take over the window. Whatever is open there
         // (say, a live replay of this match) closes first: its shutdown
         // clears the match settings the host sends, so they wait until it's gone.
